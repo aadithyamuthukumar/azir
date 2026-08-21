@@ -8,6 +8,7 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
+    "azir": "file:../sdk/typescript",
     "dotenv": "^16.4.7",
     "openai": "^5.12.2"
   },
