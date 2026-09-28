@@ -15,3 +15,17 @@ class ChatRequest(BaseModel):
     temperature: float | None = None
     stream : bool = False
 
+class Usage(BaseModel):
+    prompt_tokens: int
+    completion_tokens: int
+    total_tokens: int
+
+class Choice(BaseModel):
+    message: Message
+    finish_reason: str | None = None
+
+class ChatResponse(BaseModel):
+    model: str
+    choices: list[Choice]
+    usage: Usage
+

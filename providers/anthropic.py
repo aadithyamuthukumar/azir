@@ -1,35 +1,79 @@
 import httpx
 
 from config import settings
-from schemas import ChatRequest
+from schemas import ChatRequest, ChatResponse, Choice, Usage, Message
+from providers.base import Provider
 
-async def complete(request: ChatRequest):
-    payload = {
-        "model": request.model,
-        "max_tokens": request.max_tokens or 200,
-        "messages":[
-            {
-                "role": message.role,
-                "content": message.content,
-            }
+class AnthropicProvider(Provider):
+
+    def __init__(self, client: httpx.AsyncClient):
+        self.client = client
+
+    
+
+
+    async def complete(self, request: ChatRequest):
+        
+        system_messages = [
+            message.content
             for message in request.messages
-            if message.role != "system"
-        ]   
-    }
+            if message.role == "system"
+        ]
 
-    headers = {
-        "x-api-key": settings.anthropic_api_key,
-        "anthropic-version": "2023-06-01",
-        "content-type": "application/json",
-    }
+    
+        payload = {
+            "model": request.model,
+            "max_tokens": request.max_tokens or 200,
+            "messages":[
+                {
+                    "role": message.role,
+                    "content": message.content,
+                }
+                for message in request.messages
+                if message.role != "system"
+            ]   
+        }
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            "https://api.anthropic.com/v1/messages",
-            headers=headers,
-            json=payload,
+        headers = {
+            "x-api-key": settings.anthropic_api_key,
+            "anthropic-version": "2023-06-01",
+            "content-type": "application/json",
+        }
+
+
+        if system_messages:
+            payload["system"] = "\n".join(system_messages)
+
+        response = await self.client.post(
+                "https://api.anthropic.com/v1/messages",
+                headers=headers,
+                json=payload,
+            )
+
+        response.raise_for_status()
+
+        data = response.json()
+
+        text = data["content"][0]["text"]
+
+        return ChatResponse(
+            model=data["model"],
+            choices=[
+                Choice(
+                    message=Message(
+                        role="assistant",
+                        content=text,
+                    ),
+                    finish_reason="stop",
+                )
+            ],
+            usage=Usage(
+                prompt_tokens=data["usage"]["input_tokens"],
+                completion_tokens=data["usage"]["output_tokens"],
+                total_tokens=(
+                    data["usage"]["input_tokens"]
+                    + data["usage"]["output_tokens"]
+                ),
+            ),
         )
 
-    response.raise_for_status()
-
-    return response.json()
