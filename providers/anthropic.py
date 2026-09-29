@@ -9,7 +9,15 @@ class AnthropicProvider(Provider):
     def __init__(self, client: httpx.AsyncClient):
         self.client = client
 
-    
+
+    def map_finish_reason(self, stop_reason: str | None) -> str | None:
+        mapping = {
+            "end_turn": "stop",
+            "stop_sequence": "stop",
+            "max_tokens": "length",
+        }
+
+        return mapping.get(stop_reason, stop_reason)
 
 
     async def complete(self, request: ChatRequest):
@@ -64,7 +72,7 @@ class AnthropicProvider(Provider):
                         role="assistant",
                         content=text,
                     ),
-                    finish_reason="stop",
+                    finish_reason = self.map_finish_reason(data.get("stop_reason"))
                 )
             ],
             usage=Usage(
