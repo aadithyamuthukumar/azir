@@ -3,6 +3,7 @@ import httpx
 from config import settings
 from schemas import ChatRequest, ChatResponse, Choice, Usage, Message
 from providers.base import Provider
+from providers.errors import raise_provider_error
 
 class AnthropicProvider(Provider):
 
@@ -52,13 +53,16 @@ class AnthropicProvider(Provider):
         if system_messages:
             payload["system"] = "\n".join(system_messages)
 
-        response = await self.client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers=headers,
-                json=payload,
-            )
+        try:
+            response = await self.client.post(
+                    "https://api.anthropic.com/v1/messages",
+                    headers=headers,
+                    json=payload,
+                )
 
-        response.raise_for_status()
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise_provider_error(exc, provider="Anthropic")
 
         data = response.json()
 

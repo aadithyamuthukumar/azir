@@ -2,6 +2,7 @@ import httpx
 
 from config import settings
 from providers.base import Provider
+from providers.errors import raise_provider_error
 from schemas import ChatRequest, ChatResponse, Choice, Message, Usage
 
 
@@ -33,13 +34,16 @@ class OpenAIProvider(Provider):
             "Content-Type": "application/json",
         }
 
-        response = await self.client.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers=headers,
-            json=payload,
-        )
+        try:
+            response = await self.client.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers=headers,
+                json=payload,
+            )
 
-        response.raise_for_status()
+            response.raise_for_status()
+        except (httpx.HTTPStatusError, httpx.RequestError) as exc:
+            raise_provider_error(exc, provider="OpenAI")
 
         data = response.json()
 

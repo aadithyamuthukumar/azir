@@ -5,6 +5,7 @@ from fastapi import FastAPI, HTTPException
 
 from providers.anthropic import AnthropicProvider
 from providers.openai import OpenAIProvider
+from router import select_provider
 from schemas import ChatRequest, ChatResponse
 
 
@@ -39,9 +40,6 @@ async def chat(request: ChatRequest):
             detail="Streaming is not supported yet",
         )
 
-    if request.model.startswith("claude"):
-        provider = app.state.anthropic_provider
-    else:
-        provider = app.state.openai_provider
+    provider = select_provider(app, request.model)
 
     return await provider.complete(request)
