@@ -172,9 +172,11 @@ azir/
 │   ├── anthropic.py
 │   └── openai.py
 ├── tests/
-├── .env
+├── .github/workflows/tests.yml
+├── .env.example        (copy to .env, which is git-ignored)
 ├── .gitignore
-└── pyproject.toml
+├── pyproject.toml
+└── uv.lock
 ```
 
 ### `main.py`
@@ -299,21 +301,28 @@ Records are emitted as single-line JSON via a dedicated `azir.telemetry` logger 
 
 ## Configuration
 
-Create a `.env` file:
+Copy the example file and fill in your keys:
+
+```bash
+cp .env.example .env
+```
 
 ```env
 ANTHROPIC_API_KEY=your_anthropic_key
 OPENAI_API_KEY=your_openai_key
 ```
 
-Never commit `.env`. Configuration is loaded through `pydantic-settings`; a missing key fails at startup rather than at request time.
+`.env` is git-ignored; never commit it. Configuration is loaded through `pydantic-settings` (real environment variables take priority over `.env`); a missing key fails at startup rather than at request time.
 
 ## Setup
 
-Install dependencies with `uv`:
+Requires [uv](https://docs.astral.sh/uv/) (Python 3.13 is picked up from `.python-version`).
 
 ```bash
+git clone <your-repo-url> azir
+cd azir
 uv sync
+cp .env.example .env   # then add your keys
 ```
 
 Run the server:
@@ -324,11 +333,28 @@ uv run uvicorn main:app --reload
 
 The API will be available at `http://127.0.0.1:8000` (interactive docs at `/docs`).
 
-Run the tests (no real provider calls are made):
+Run the tests:
 
 ```bash
 uv run pytest
 ```
+
+Tests need no `.env` and no API keys: `tests/conftest.py` sets dummy keys, and every provider call is mocked. The same command runs in CI (`.github/workflows/tests.yml`) on pushes to `main` and on pull requests.
+
+## Security
+
+Azir holds your provider API keys and spends money on every request it forwards. What it does today:
+
+- API keys are read only from the environment / `.env` and sent only to the matching provider's API over HTTPS.
+- Client-facing errors use fixed, templated messages -- raw provider response bodies, headers, and keys are never returned to the caller.
+- Telemetry logs metadata only (provider, model, status, latency, token counts, cost estimate) -- never prompts, completions, or keys.
+- Request validation rejects malformed input, including non-positive `max_tokens` and negative `max_cost_usd`.
+
+What it does **not** do yet -- keep this in mind before exposing it beyond your machine:
+
+- **No authentication.** Anyone who can reach the server can use your provider keys. `uvicorn` binds to `127.0.0.1` by default; don't run it with `--host 0.0.0.0` or put it behind a public endpoint without adding auth in front of it (e.g. a reverse proxy).
+- **No rate limiting or request-size limits** beyond `max_tokens`, so a client can send arbitrarily large prompts.
+- **`max_cost_usd` is a routing estimate, not a spending cap.** It only filters which model `azir-auto` picks; it does not enforce actual spend. Use provider-side spend limits for that.
 
 ## Example Requests
 
@@ -443,6 +469,7 @@ One `AsyncClient` is created during FastAPI startup and reused across requests f
 
 Azir does not yet support:
 
+- authentication or rate limiting (see Security)
 - cross-provider fallback for streaming requests
 - telemetry for streaming requests
 - retries within a single provider (fallback moves to the *next provider*)

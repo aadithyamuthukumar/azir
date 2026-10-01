@@ -1,7 +1,7 @@
 [project]
 name = "azir"
 version = "0.1.0"
-description = "Add your description here"
+description = "Lightweight multi-provider LLM gateway with capability- and cost-aware routing"
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = [

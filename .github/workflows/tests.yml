@@ -1,0 +1,25 @@
+name: tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      # Python version comes from .python-version; --locked fails if uv.lock
+      # is out of date with pyproject.toml.
+      - run: uv sync --locked
+
+      # No API keys needed: tests/conftest.py sets dummy keys and no test
+      # makes a real provider call.
+      - run: uv run pytest
