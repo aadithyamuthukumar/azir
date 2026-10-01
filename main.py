@@ -1,11 +1,12 @@
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
+from fastapi.responses import StreamingResponse
 
 from providers.anthropic import AnthropicProvider
 from providers.openai import OpenAIProvider
-from router import select_provider
+from router import route_request, stream_chat_completion
 from schemas import ChatRequest, ChatResponse
 
 
@@ -35,11 +36,7 @@ def root():
 )
 async def chat(request: ChatRequest):
     if request.stream:
-        raise HTTPException(
-            status_code=400,
-            detail="Streaming is not supported yet",
-        )
+        event_stream = await stream_chat_completion(app, request)
+        return StreamingResponse(event_stream, media_type="text/event-stream")
 
-    provider = select_provider(app, request.model)
-
-    return await provider.complete(request)
+    return await route_request(app, request)

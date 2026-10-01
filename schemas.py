@@ -13,7 +13,10 @@ class ChatRequest(BaseModel):
     messages: list[Message]
     max_tokens: int | None = None
     temperature: float | None = None
-    stream : bool = False
+    stream: bool = False
+    # Required capability when model is "azir-auto" (e.g. "coding"). When
+    # given, it also restricts which models may serve as fallbacks.
+    task: str | None = None
 
 class Usage(BaseModel):
     prompt_tokens: int

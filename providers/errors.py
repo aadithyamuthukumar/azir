@@ -50,3 +50,28 @@ def raise_provider_error(exc: Exception, provider: str) -> None:
         ) from exc
 
     raise exc
+
+
+# Statuses produced by raise_provider_error() for transient, provider-side
+# conditions: rate limiting, unavailability, gateway errors, timeouts.
+_TRANSIENT_STATUS_CODES = frozenset({429, 500, 502, 503, 504})
+
+
+def is_transient_provider_error(exc: HTTPException) -> bool:
+    """Whether a provider failure is worth retrying on another provider.
+
+    Client/request errors (400, 404, ...) and credential/permission errors
+    (401, 403) are not: another provider won't fix a malformed request, and
+    a misconfigured key should surface rather than be masked by fallback.
+    An unrecognized upstream 4xx is mapped to 502 for the client, but is
+    still a request problem, so the original upstream status is checked too.
+    """
+    if exc.status_code not in _TRANSIENT_STATUS_CODES:
+        return False
+
+    cause = exc.__cause__
+    if isinstance(cause, httpx.HTTPStatusError):
+        upstream_status = cause.response.status_code
+        return upstream_status == 429 or upstream_status >= 500
+
+    return True
