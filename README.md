@@ -176,7 +176,8 @@ azir/
 ├── .env.example        (copy to .env, which is git-ignored)
 ├── .gitignore
 ├── pyproject.toml
-└── uv.lock
+├── uv.lock
+└── LICENSE
 ```
 
 ### `main.py`
@@ -487,3 +488,7 @@ Not implemented today:
 2. Health-aware routing (provider health scoring, circuit breaking)
 3. Telemetry persistence and aggregation, including streaming telemetry
 4. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-aware selection)
+
+## License
+
+[MIT](LICENSE)
