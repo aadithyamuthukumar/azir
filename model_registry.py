@@ -10,13 +10,20 @@ class ModelConfig:
     capabilities: set[str]
     enabled: bool = True
 
+    def estimate_cost_usd(self, input_tokens: int, output_tokens: int) -> float:
+        return (
+            (input_tokens / 1000) * self.input_cost_per_1k
+            + (output_tokens / 1000) * self.output_cost_per_1k
+        )
+
 
 # The single source of truth for which concrete models Azir can route to.
-# Insertion order is significant: it is the deterministic preference order
-# used when `azir-auto` or fallback has to choose among several models.
+# Insertion order is significant: it picks the fallback model per provider,
+# and breaks ties between equally cheap `azir-auto` candidates.
 #
-# Costs are rough, static USD-per-1K-token rates used only for telemetry
-# estimates -- not a substitute for each provider's current pricing.
+# Costs are rough, static USD-per-1K-token rates used for cost-aware routing
+# and telemetry estimates -- not a substitute for each provider's current
+# pricing.
 MODEL_REGISTRY = {
     "claude-sonnet-4-6": ModelConfig(
         name="claude-sonnet-4-6",

@@ -16,7 +16,7 @@ Azir currently supports:
 - Shared `httpx.AsyncClient`
 - A model registry (`model_registry.py`) as the single source of truth for routable models
 - Explicit model routing (e.g. `"model": "claude-sonnet-4-6"`)
-- Capability-aware automatic routing (`"model": "azir-auto"` plus `"task"`)
+- Capability- and cost-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget)
 - Fallback across providers on transient upstream failures (non-streaming)
 - Clean, normalized provider error handling
 - Per-attempt telemetry for non-streaming requests (provider, model, latency, token usage, status, estimated cost)
@@ -31,16 +31,37 @@ Azir currently supports:
 ```text
 request.model
   |
-  +-- "azir-auto" --> task missing?                 -> 400
-  |                   no enabled model has task?    -> 400
-  |                   else first enabled model (registry order) with that capability
+  +-- "azir-auto" --> task missing?                         -> 400
+  |                   no enabled model has task?            -> 400
+  |                   none within max_cost_usd (if given)?  -> 400
+  |                   else lowest estimated request cost
+  |                        (ties -> registry order)
   |
   +-- anything else --> not in registry?            -> 400 Unknown model
                         disabled?                   -> 400 Model is disabled
-                        else that registry entry
+                        else that registry entry (task / max_cost_usd don't affect it)
   |
   v
 concrete ModelConfig (name + provider)
+```
+
+### Routing cost estimate (`azir-auto` only)
+
+Before execution, each candidate model's request cost is estimated from the registry's per-1K-token prices:
+
+```text
+input_tokens  = ceil(total characters of all message content / 4)
+output_tokens = max_tokens, or 200 if not set (the same default AnthropicProvider sends)
+cost          = input_tokens/1000 * input_cost_per_1k + output_tokens/1000 * output_cost_per_1k
+```
+
+This is a deterministic routing heuristic only -- no tokenizer or provider API is involved, and it is not what providers will bill. Telemetry's `estimated_cost_usd` is computed separately, after the request, from the provider's actual returned token usage.
+
+Example with the current registry, for a 2-character prompt and no `max_tokens` (1 input token, 200 output tokens), `task: "chat"`:
+
+```text
+claude-sonnet-4-6:  0.001 * 0.003   + 0.2 * 0.015  = 0.003003    USD
+gpt-4o-mini:        0.001 * 0.00015 + 0.2 * 0.0006 = 0.00012015  USD  <- selected
 ```
 
 Resolution always happens before any provider is called, so providers, fallback, telemetry, and streaming only ever see concrete model names -- never `azir-auto`.
@@ -172,7 +193,10 @@ Owns the HTTP layer only:
 
 Defines Azir's request and response contracts using Pydantic: `Message`, `ChatRequest`, `ChatResponse`, `Choice`, `Usage`.
 
-`ChatRequest` fields: `model`, `messages`, `max_tokens`, `temperature`, `stream`, and an optional `task`. `task` is required when `model` is `azir-auto`; when given, it also restricts which models may be used as fallbacks. It is never forwarded to a provider.
+`ChatRequest` fields: `model`, `messages`, `max_tokens`, `temperature`, `stream`, and the optional routing fields `task` and `max_cost_usd`. Neither routing field is ever forwarded to a provider.
+
+- `task` is required when `model` is `azir-auto`; when given, it also restricts which models may be used as fallbacks.
+- `max_cost_usd` (>= 0) caps the *estimated* request cost of every model Azir picks itself -- the `azir-auto` choice and any fallback. An explicitly named model is always honored regardless of it.
 
 ### `model_registry.py`
 
@@ -182,16 +206,18 @@ The single source of truth for which concrete models Azir can route to. Each `Mo
 - `provider`
 - `capabilities` (e.g. `chat`, `coding`, `reasoning`, `classification`)
 - `enabled`
-- `input_cost_per_1k` / `output_cost_per_1k` (rough static rates, used only for telemetry estimates)
+- `input_cost_per_1k` / `output_cost_per_1k` (rough static USD rates, used for `azir-auto` cost estimates and telemetry estimates)
+
+`ModelConfig.estimate_cost_usd(input_tokens, output_tokens)` is the one place the pricing formula lives; both the router and telemetry use it.
 
 Currently registered:
 
-| Model               | Provider    | Capabilities                 |
-|---------------------|-------------|------------------------------|
-| `claude-sonnet-4-6` | `anthropic` | chat, coding, reasoning      |
-| `gpt-4o-mini`       | `openai`    | chat, classification         |
+| Model               | Provider    | Capabilities                 | USD / 1K in | USD / 1K out |
+|---------------------|-------------|------------------------------|-------------|--------------|
+| `claude-sonnet-4-6` | `anthropic` | chat, coding, reasoning      | 0.003       | 0.015        |
+| `gpt-4o-mini`       | `openai`    | chat, classification         | 0.00015     | 0.0006       |
 
-`find_models(capability=..., provider=...)` returns enabled models matching the filters, **in registry order**. That order is what makes `azir-auto` and fallback selection deterministic.
+`find_models(capability=..., provider=...)` returns enabled models matching the filters, **in registry order**. That order picks each provider's fallback model and breaks ties between equally cheap `azir-auto` candidates, so selection is always deterministic.
 
 Models not in the registry are rejected with a 400 -- there is no `claude-*` / `gpt-*` prefix-based routing. To route to a new model, register it.
 
@@ -199,8 +225,9 @@ Models not in the registry are rejected with a 400 -- there is no `claude-*` / `
 
 Routing and orchestration:
 
-- `resolve_model(request)` -- explicit model or `azir-auto` + `task` -> one enabled, registered `ModelConfig` (or a clean 400; a registry entry naming a provider Azir doesn't implement is a 500 configuration error)
-- `plan_attempts(request)` -- the resolved model, then for each other provider in `PROVIDER_ORDER` the first enabled registry model of that provider (that also supports `task`, if given)
+- `estimate_request_tokens(request)` / `estimate_request_cost_usd(request, config)` -- the pre-execution routing estimate described above
+- `resolve_model(request)` -- explicit model as-is, or for `azir-auto` + `task` the cheapest capable enabled model within `max_cost_usd` -> one `ModelConfig` (or a clean 400; a registry entry naming a provider Azir doesn't implement is a 500 configuration error)
+- `plan_attempts(request)` -- the resolved model, then for each other provider in `PROVIDER_ORDER` the first enabled registry model of that provider (that also supports `task` and fits `max_cost_usd`, if given)
 - `route_request(app, request)` -- runs the plan for non-streaming requests, with fallback and per-attempt telemetry
 - `stream_chat_completion(app, request)` -- resolves the model, then calls that provider's `stream()`; no fallback
 
@@ -209,7 +236,7 @@ Routing and orchestration:
 - malformed requests (upstream 400) and other request-level upstream 4xx
 - credential / permission errors (401 / 403) -- these indicate misconfiguration and should surface, not be masked
 - model/resource not found (404)
-- Azir's own routing errors (unknown model, disabled model, missing or unsupported task) -- these are rejected before any provider is called
+- Azir's own routing errors (unknown model, disabled model, missing or unsupported task, nothing within `max_cost_usd`) -- these are rejected before any provider is called
 
 ### `providers/base.py`
 
@@ -330,6 +357,20 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+Automatic routing with a cost budget (returns 400 if no capable model's estimated cost fits):
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "azir-auto",
+    "task": "chat",
+    "max_cost_usd": 0.001,
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 50
+  }'
+```
+
 Every provider returns the same response shape (`model` is the name the provider reports):
 
 ```json
@@ -407,14 +448,15 @@ Azir does not yet support:
 - retries within a single provider (fallback moves to the *next provider*)
 - telemetry persistence or aggregation (records are logged, not stored)
 - billing-accurate cost tracking (only rough static rates from the registry)
+- accurate pre-execution token counts (routing uses a characters/4 heuristic)
+- cost-based ordering of fallbacks (fallbacks use registry order, filtered by task and budget)
 - routing to models that aren't in the registry
 
 ## Future Work
 
 Not implemented today:
 
-1. Cost-aware routing
-2. Latency-aware routing
-3. Health-aware routing (provider health scoring, circuit breaking)
-4. Telemetry persistence and aggregation, including streaming telemetry
-5. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection)
+1. Latency-aware routing
+2. Health-aware routing (provider health scoring, circuit breaking)
+3. Telemetry persistence and aggregation, including streaming telemetry
+4. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-aware selection)

@@ -48,7 +48,12 @@ def test_non_streaming_azir_auto(client):
 
 @pytest.mark.parametrize(
     "payload",
-    [body("mystery-model"), body("azir-auto"), body("azir-auto", task="image-generation")],
+    [
+        body("mystery-model"),
+        body("azir-auto"),
+        body("azir-auto", task="image-generation"),
+        body("azir-auto", task="coding", max_cost_usd=0.0001),
+    ],
 )
 def test_routing_errors_are_clean_400s(client, payload):
     response = client.post("/v1/chat/completions", json=payload)

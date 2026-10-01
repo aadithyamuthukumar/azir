@@ -35,10 +35,7 @@ def estimate_cost_usd(
     ):
         return None
 
-    return (
-        (prompt_tokens / 1000) * config.input_cost_per_1k
-        + (completion_tokens / 1000) * config.output_cost_per_1k
-    )
+    return config.estimate_cost_usd(prompt_tokens, completion_tokens)
 
 
 @dataclass
