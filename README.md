@@ -16,7 +16,7 @@ Azir currently supports:
 - Shared `httpx.AsyncClient`
 - A model registry (`model_registry.py`) as the single source of truth for routable models
 - Explicit model routing (e.g. `"model": "claude-sonnet-4-6"`)
-- Capability-, cost-, and latency-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget, optional `"routing_policy"`: `cheap`, `fast`, or `balanced` (default))
+- Capability-, cost-, and latency-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget, optional `"routing_policy"`: `cheap`, `fast`, or `balanced` (default)), skipping models that have been failing recently (health-aware)
 - Fallback across providers on transient upstream failures (non-streaming)
 - Clean, normalized provider error handling
 - Per-attempt telemetry for non-streaming requests (provider, model, latency, token usage, status, estimated cost)
@@ -34,7 +34,8 @@ request.model
   +-- "azir-auto" --> task missing?                         -> 400
   |                   no enabled model has task?            -> 400
   |                   none within max_cost_usd (if given)?  -> 400
-  |                   else rank the eligible models by routing_policy
+  |                   drop unhealthy models (unless all are unhealthy)
+  |                   rank the remaining models by routing_policy
   |                        (default "balanced"; ties -> registry order):
   |                          cheap    -> lowest estimated cost
   |                          fast     -> lowest latency estimate
@@ -43,7 +44,7 @@ request.model
   +-- anything else --> not in registry?            -> 400 Unknown model
                         disabled?                   -> 400 Model is disabled
                         else that registry entry (task / max_cost_usd /
-                        routing_policy don't affect it)
+                        routing_policy / health don't affect it)
   |
   v
 concrete ModelConfig (name + provider)
@@ -100,7 +101,7 @@ State is per process and lost on restart; it is not persisted or shared between 
 
 ### Routing policies (`azir-auto` only)
 
-Every policy ranks the **same** candidate set -- enabled models with the `task` capability that fit `max_cost_usd` -- and the lowest score wins. Exact ties go to registry order. No `routing_policy` means `balanced`.
+Every policy ranks the **same** candidate set -- enabled models with the `task` capability that fit `max_cost_usd`, minus unhealthy ones (see "Model health" below) -- and the lowest score wins. Exact ties go to registry order. No `routing_policy` means `balanced`.
 
 | Policy     | Score                                                                    |
 |------------|--------------------------------------------------------------------------|
@@ -132,6 +133,44 @@ C       3.0          0.6    300 ms    1.0        0.0           0.5
 cheap -> A      fast -> C      balanced -> B
 ```
 
+### Model health (`azir-auto` only)
+
+`health.py` keeps the last 20 provider outcomes per concrete model, in memory:
+
+```text
+success_rate = successes in window / outcomes in window
+unhealthy    = outcomes >= 5 (MIN_HEALTH_SAMPLES)
+               and success_rate < 0.6 (HEALTH_SUCCESS_THRESHOLD)
+```
+
+A model with fewer than 5 recorded outcomes is never unhealthy. Exactly 0.6 is healthy. Old outcomes fall out of the window as new ones arrive, so a recovered model becomes eligible again on its own -- but only once it gets traffic, e.g. as a fallback or an explicit request.
+
+What is recorded, at the same per-attempt point as telemetry and fallback:
+
+| Outcome | Recorded as |
+|---|---|
+| Non-streaming attempt succeeds (primary or fallback) | success |
+| Non-streaming attempt fails transiently (429, upstream 5xx, timeout, connection failure) | failure |
+| Stream opens successfully | success (stream duration and mid-stream errors are not considered) |
+| Stream fails transiently before it opens | failure |
+| Non-transient provider error (400, 401, 403, 404, other upstream 4xx) | nothing -- request or configuration problem, not model health |
+| Rejected before any provider is called (unknown/disabled model, missing/unsupported task, over budget, invalid request) | nothing |
+
+How it affects routing:
+
+- **`azir-auto`:** unhealthy models are removed after the budget filter, before the routing policy ranks what is left. `balanced` normalizes across the healthy candidates only.
+- **Every eligible model unhealthy:** the filter is skipped and the policy ranks the full eligible set, exactly as if there were no health state. Azir never returns a 400 just because of health; a failing primary still falls back normally.
+- **Explicit models** are always used, healthy or not.
+- **Fallbacks** keep their existing rule (first enabled model per other provider that fits `task` and budget). Health does not filter them.
+
+Example, `task: "chat"`, `routing_policy: "cheap"`, after `gpt-4o-mini` recorded 2 successes and 4 failures (2/6 = 0.33 < 0.6, unhealthy) and `claude-sonnet-4-6` 3 successes (fewer than 5 samples, healthy):
+
+```text
+eligible:   claude-sonnet-4-6, gpt-4o-mini
+healthy:    claude-sonnet-4-6
+cheap ->    claude-sonnet-4-6   (gpt-4o-mini would win on cost if it were healthy)
+```
+
 Resolution always happens before any provider is called, so providers, fallback, telemetry, and streaming only ever see concrete model names -- never `azir-auto`.
 
 ### Non-streaming
@@ -150,8 +189,9 @@ router.plan_attempts(...)  --> [resolved model, one fallback per other provider]
   |
   +--> attempt 1: provider.complete(concrete model)
   |       |
-  |       +-- success ----------------> emit telemetry, record latency --> ChatResponse
-  |       +-- transient failure ------> emit telemetry (+ record latency if timeout) --> next attempt
+  |       +-- success ----------------> emit telemetry, record latency + health success --> ChatResponse
+  |       +-- transient failure ------> emit telemetry, record health failure
+  |                                     (+ latency if timeout) --> next attempt
   |       +-- non-recoverable failure -> emit telemetry --> raise immediately
   |
   +--> attempt 2 ... (same rules); if all fail transiently, re-raise the last error
@@ -189,7 +229,7 @@ router.resolve_model(...)              <-- same resolution as above; 400s happen
                  Client (incremental `data: {...}` chunks, ending in `data: [DONE]`)
 ```
 
-Streams read the current latency estimates when resolving `azir-auto` but never update them. There is no cross-provider fallback and no telemetry on the streaming path -- see "Streaming" under Important Design Decisions and Current Limitations.
+Streams read the current latency estimates when resolving `azir-auto` but never update them. They do update health: a success when the stream opens, a failure on a transient pre-stream error. There is no cross-provider fallback and no telemetry on the streaming path -- see "Streaming" under Important Design Decisions and Current Limitations.
 
 ## Why Azir Exists
 
@@ -220,6 +260,8 @@ router.py
    |
    +--> latency.py
    |
+   +--> health.py
+   |
    +--> AnthropicProvider
    |
    +--> OpenAIProvider
@@ -234,6 +276,7 @@ azir/
 ├── router.py
 ├── model_registry.py
 ├── latency.py
+├── health.py
 ├── telemetry.py
 ├── schemas.py
 ├── config.py
@@ -307,6 +350,18 @@ In-memory latency state keyed by concrete model name (see "Routing latency estim
 
 Updates are synchronous and lock-guarded. Nothing is persisted.
 
+### `health.py`
+
+In-memory rolling window of recent provider outcomes per concrete model (see "Model health" above):
+
+- `record_success(model)` / `record_failure(model)` -- append one outcome to the model's last-20 window
+- `get_success_rate(model)` -- successes / outcomes in the window, or `None` if none recorded
+- `get_sample_count(model)` -- outcomes in the window
+- `is_healthy(model)` -- `True` below 5 samples; otherwise success rate >= 0.6
+- `reset_health()` -- clear everything (used by tests)
+
+Health state is the router's current signal; telemetry is the separate historical event log. Neither is derived from the other.
+
 ### `router.py`
 
 Routing and orchestration:
@@ -314,10 +369,11 @@ Routing and orchestration:
 - `estimate_request_tokens(request)` / `estimate_request_cost_usd(request, config)` -- the pre-execution routing estimate described above
 - `routing_latency_ms(config)` -- the model's latency estimate, or the cold-start default
 - `_eligible_candidates(request)` -- the shared `azir-auto` eligibility phase (task required, capability + enabled filter, budget filter, clean 400s)
+- `_prefer_healthy(candidates)` -- drop unhealthy candidates, unless that would drop all of them
 - `normalize(values)` / `select_by_policy(request, candidates)` -- rank the eligible candidates by `cheap`, `fast`, or `balanced` (see "Routing policies")
 - `resolve_model(request)` -- explicit model as-is, or for `azir-auto` the policy-selected eligible model -> one `ModelConfig` (or a clean 400; a registry entry naming a provider Azir doesn't implement is a 500 configuration error)
 - `plan_attempts(request)` -- the resolved model, then for each other provider in `PROVIDER_ORDER` the first enabled registry model of that provider (that also supports `task` and fits `max_cost_usd`, if given)
-- `route_request(app, request)` -- runs the plan for non-streaming requests, with fallback, per-attempt telemetry, and latency recording
+- `route_request(app, request)` -- runs the plan for non-streaming requests, with fallback, per-attempt telemetry, and latency and health recording
 - `stream_chat_completion(app, request)` -- resolves the model, then calls that provider's `stream()`; no fallback
 
 **Fallback policy.** `route_request()` moves to the next attempt only when `providers.errors.is_transient_provider_error()` says the failure is transient: rate limiting (429), provider unavailability / unexpected 5xx (500/502/503), and timeouts (504) or connection failures. Anything else is raised immediately without trying another provider:
@@ -579,7 +635,8 @@ Azir does not yet support:
 - billing-accurate cost tracking (only rough static rates from the registry)
 - accurate pre-execution token counts (routing uses a characters/4 heuristic)
 - cost- or latency-based ordering of fallbacks (fallbacks use registry order, filtered by task and budget)
-- persisted or shared latency history (estimates live in one process's memory and reset on restart)
+- persisted or shared latency or health history (both live in one process's memory and reset on restart)
+- health-filtered fallbacks, active health checks, or time-based circuit breaking (an unhealthy model only recovers as new outcomes for it are recorded)
 - latency samples from streaming requests
 - routing to models that aren't in the registry
 
@@ -587,7 +644,7 @@ Azir does not yet support:
 
 Not implemented today:
 
-1. Health-aware routing (provider health scoring, circuit breaking)
+1. Richer health handling (time-based circuit breaking, active probes, health-filtered fallbacks)
 2. Telemetry persistence and aggregation, including streaming telemetry
 3. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-aware selection)
 

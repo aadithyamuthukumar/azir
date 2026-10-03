@@ -9,6 +9,7 @@ from pydantic import ValidationError
 
 import model_registry
 import router
+from health import MIN_HEALTH_SAMPLES, get_sample_count, get_success_rate, is_healthy, record_failure
 from latency import DEFAULT_LATENCY_ESTIMATE_MS, get_latency_stats, record_latency
 from model_registry import MODEL_REGISTRY, ModelConfig
 from router import (
@@ -553,6 +554,89 @@ def test_budget_filter_applies_to_every_policy(three_models, policy):
     assert exc_info.value.status_code == 400
 
 
+# --- Health-aware azir-auto selection ---
+
+
+def make_unhealthy(name: str) -> None:
+    for _ in range(MIN_HEALTH_SAMPLES):
+        record_failure(name)
+    assert not is_healthy(name)
+
+
+@pytest.mark.parametrize("explicit", [ANTHROPIC_MODEL, OPENAI_MODEL])
+def test_explicit_model_is_used_even_when_unhealthy(explicit):
+    make_unhealthy(explicit)
+    request = make_request(explicit, "chat")
+
+    assert resolve_model(request).name == explicit
+    assert plan_attempts(request)[0].name == explicit
+
+
+def test_auto_excludes_unhealthy_model():
+    # cold start: balanced picks the cheaper gpt-4o-mini...
+    assert resolve_model(make_request("azir-auto", "chat")).name == OPENAI_MODEL
+
+    # ...until it is unhealthy
+    make_unhealthy(OPENAI_MODEL)
+    assert resolve_model(make_request("azir-auto", "chat")).name == ANTHROPIC_MODEL
+
+
+def test_auto_keeps_model_with_insufficient_history():
+    for _ in range(MIN_HEALTH_SAMPLES - 1):
+        record_failure(OPENAI_MODEL)
+
+    assert resolve_model(make_request("azir-auto", "chat")).name == OPENAI_MODEL
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+def test_auto_with_every_candidate_unhealthy_uses_full_eligible_set(policy):
+    request = make_request("azir-auto", "chat", routing_policy=policy)
+    expected = resolve_model(request).name
+
+    make_unhealthy(ANTHROPIC_MODEL)
+    make_unhealthy(OPENAI_MODEL)
+
+    # no 400: same choice as if there were no health state at all
+    assert resolve_model(request).name == expected
+
+
+def test_auto_only_capable_model_unhealthy_is_still_routed():
+    make_unhealthy(ANTHROPIC_MODEL)
+
+    assert resolve_model(make_request("azir-auto", "coding")).name == ANTHROPIC_MODEL
+
+
+def test_cheap_picks_cheapest_healthy_model(three_models):
+    make_unhealthy("cheap")
+
+    assert resolve_model(cost_request(routing_policy="cheap")).name == "middle"
+
+
+def test_fast_picks_fastest_healthy_model(three_models):
+    make_unhealthy("quick")
+
+    assert resolve_model(cost_request(routing_policy="fast")).name == "middle"
+
+
+def test_balanced_scores_only_healthy_candidates(registry):
+    # "dominant" is cheapest and fastest (score 0) until it is unhealthy;
+    # the rest are then normalized among themselves, as in `three_models`
+    registry(
+        model("cheap", provider="openai", input_cost=0.0, output_cost=1.0),
+        model("middle", input_cost=0.0, output_cost=2.0),
+        model("quick", input_cost=0.0, output_cost=3.0),
+        model("dominant", input_cost=0.0, output_cost=0.5),
+    )
+    for name, latency_ms in [("cheap", 900.0), ("middle", 400.0), ("quick", 300.0), ("dominant", 100.0)]:
+        record_latency(name, latency_ms)
+
+    request = cost_request(routing_policy="balanced")
+    assert resolve_model(request).name == "dominant"
+
+    make_unhealthy("dominant")
+    assert resolve_model(request).name == "middle"
+
+
 # --- Fallback planning ---
 
 
@@ -851,6 +935,104 @@ async def test_route_request_telemetry_records_policy_selected_concrete_model(ca
     assert record["status"] == "success"
 
 
+# --- Health recording ---
+
+
+@pytest.mark.anyio
+async def test_route_request_records_success():
+    app = make_app(openai=StubProvider(result=make_response(OPENAI_MODEL)))
+
+    await route_request(app, make_request("azir-auto", "chat"))
+
+    assert (get_sample_count(OPENAI_MODEL), get_success_rate(OPENAI_MODEL)) == (1, 1.0)
+    assert get_sample_count(ANTHROPIC_MODEL) == 0
+    assert get_sample_count("azir-auto") == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error", [upstream_error(429, 429), upstream_error(503, 502), timeout_error(), connect_error()]
+)
+async def test_route_request_records_transient_failure_and_fallback_success_independently(error):
+    anthropic = StubProvider(error=error)
+    openai = StubProvider(result=make_response(OPENAI_MODEL))
+
+    await route_request(make_app(anthropic, openai), make_request(ANTHROPIC_MODEL))
+
+    assert (get_sample_count(ANTHROPIC_MODEL), get_success_rate(ANTHROPIC_MODEL)) == (1, 0.0)
+    assert (get_sample_count(OPENAI_MODEL), get_success_rate(OPENAI_MODEL)) == (1, 1.0)
+
+
+@pytest.mark.anyio
+async def test_route_request_records_failure_for_every_failed_attempt():
+    anthropic = StubProvider(error=upstream_error(503, 502))
+    openai = StubProvider(error=upstream_error(429, 429))
+
+    with pytest.raises(HTTPException):
+        await route_request(make_app(anthropic, openai), make_request(ANTHROPIC_MODEL))
+
+    assert get_success_rate(ANTHROPIC_MODEL) == 0.0
+    assert get_success_rate(OPENAI_MODEL) == 0.0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error",
+    [
+        upstream_error(400, 400),
+        upstream_error(401, 401),
+        upstream_error(403, 403),
+        upstream_error(404, 404),
+        upstream_error(422, 502),
+    ],
+)
+async def test_route_request_does_not_record_non_transient_failures(error):
+    anthropic = StubProvider(error=error)
+
+    with pytest.raises(HTTPException):
+        await route_request(make_app(anthropic, StubProvider()), make_request(ANTHROPIC_MODEL))
+
+    assert get_sample_count(ANTHROPIC_MODEL) == 0
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "request_",
+    [
+        make_request("mystery-model"),
+        make_request("azir-auto"),
+        make_request("azir-auto", "image-generation"),
+        make_request("azir-auto", "coding", max_cost_usd=0.0001),
+    ],
+)
+async def test_route_request_pre_provider_errors_do_not_affect_health(request_):
+    with pytest.raises(HTTPException):
+        await route_request(make_app(), request_)
+
+    assert get_sample_count(ANTHROPIC_MODEL) == 0
+    assert get_sample_count(OPENAI_MODEL) == 0
+
+
+@pytest.mark.anyio
+async def test_repeated_failures_move_azir_auto_off_the_failing_model():
+    # gpt-4o-mini is the cheap choice but keeps returning 503; each request
+    # falls back to claude. After MIN_HEALTH_SAMPLES failures gpt-4o-mini
+    # is unhealthy and claude becomes the primary. (`cheap` keeps latency
+    # samples from claude's fallbacks out of the picture.)
+    anthropic = StubProvider(result=make_response(ANTHROPIC_MODEL))
+    openai = StubProvider(error=upstream_error(503, 502))
+    app = make_app(anthropic, openai)
+    request = make_request("azir-auto", "chat", routing_policy="cheap")
+
+    for _ in range(MIN_HEALTH_SAMPLES + 2):
+        await route_request(app, request)
+
+    assert len(openai.requests) == MIN_HEALTH_SAMPLES
+    assert len(anthropic.requests) == MIN_HEALTH_SAMPLES + 2
+    assert not is_healthy(OPENAI_MODEL)
+    assert plan_attempts(request)[0].name == ANTHROPIC_MODEL
+
+
 @pytest.mark.anyio
 async def test_observed_latency_steers_later_fast_requests(monkeypatch):
     # request 1: cold start -> both at the default -> registry order (claude), observed at 3000 ms
@@ -925,6 +1107,42 @@ async def test_stream_chat_completion_uses_policy_selected_model(policy, primary
     assert not providers[fallback].stream_requests
     # stream duration is never recorded
     assert get_latency_stats(primary).samples == 1
+
+
+@pytest.mark.anyio
+async def test_stream_chat_completion_records_success_once_stream_opens():
+    openai = StubProvider(stream_result=object())
+
+    await stream_chat_completion(make_app(StubProvider(), openai), make_request(OPENAI_MODEL))
+
+    assert (get_sample_count(OPENAI_MODEL), get_success_rate(OPENAI_MODEL)) == (1, 1.0)
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize(
+    "error, recorded",
+    [(upstream_error(503, 502), 1), (timeout_error(), 1), (upstream_error(401, 401), 0)],
+)
+async def test_stream_chat_completion_records_only_transient_pre_stream_failures(error, recorded):
+    openai = StubProvider(stream_error=error)
+
+    with pytest.raises(HTTPException):
+        await stream_chat_completion(make_app(StubProvider(), openai), make_request(OPENAI_MODEL))
+
+    assert get_sample_count(OPENAI_MODEL) == recorded
+    assert get_sample_count(ANTHROPIC_MODEL) == 0
+
+
+@pytest.mark.anyio
+async def test_stream_chat_completion_skips_unhealthy_model():
+    make_unhealthy(OPENAI_MODEL)
+    anthropic = StubProvider(stream_result=object())
+    openai = StubProvider(stream_result=object())
+
+    await stream_chat_completion(make_app(anthropic, openai), make_request("azir-auto", "chat", stream=True))
+
+    assert anthropic.stream_requests[0].model == ANTHROPIC_MODEL
+    assert not openai.stream_requests
 
 
 @pytest.mark.anyio

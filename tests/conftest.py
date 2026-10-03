@@ -10,16 +10,19 @@ import pytest
 os.environ["ANTHROPIC_API_KEY"] = "test-anthropic-key"
 os.environ["OPENAI_API_KEY"] = "test-openai-key"
 
+from health import reset_health  # noqa: E402
 from latency import reset_latency  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
-def clean_latency_state():
-    # Latency estimates are process-global; real request timings from one
-    # test must not steer azir-auto selection in another.
+def clean_routing_state():
+    # Latency estimates and health windows are process-global; outcomes
+    # from one test must not steer azir-auto selection in another.
     reset_latency()
+    reset_health()
     yield
     reset_latency()
+    reset_health()
 
 
 @pytest.fixture

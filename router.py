@@ -3,6 +3,7 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 
+from health import is_healthy, record_failure, record_success
 from latency import DEFAULT_LATENCY_ESTIMATE_MS, get_latency_estimate, record_latency
 from model_registry import ModelConfig, find_models, get_model
 from providers.errors import is_timeout_provider_error, is_transient_provider_error
@@ -103,6 +104,16 @@ def _eligible_candidates(request: ChatRequest) -> list[ModelConfig]:
     return candidates
 
 
+def _prefer_healthy(candidates: list[ModelConfig]) -> list[ModelConfig]:
+    """Drop candidates the health tracker currently marks unhealthy. If that
+    would drop all of them, keep the full set instead: stale health state
+    must not turn into a hard outage, and a failing primary still falls
+    back through `route_request` as usual.
+    """
+    healthy = [config for config in candidates if is_healthy(config.name)]
+    return healthy or candidates
+
+
 def normalize(values: list[float]) -> list[float]:
     """Min-max scale to [0, 1]: (value - min) / (max - min). If every value
     is equal, each normalizes to 0 (no spread, so no preference).
@@ -148,11 +159,13 @@ def resolve_model(request: ChatRequest) -> ModelConfig:
     model. The registry is the only source of truth: unknown or disabled
     models are rejected rather than guessed at.
 
-    An explicit model is used as-is (`routing_policy` is ignored).
-    `azir-auto` ranks the eligible candidates with `select_by_policy`.
+    An explicit model is used as-is (`routing_policy` and health are
+    ignored). `azir-auto` ranks the eligible candidates -- minus unhealthy
+    ones, unless all are unhealthy -- with `select_by_policy`.
     """
     if request.model == AUTO_MODEL:
-        config = select_by_policy(request, _eligible_candidates(request))
+        candidates = _prefer_healthy(_eligible_candidates(request))
+        config = select_by_policy(request, candidates)
     else:
         config = get_model(request.model)
 
@@ -216,7 +229,10 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
     the concrete provider/model that was actually attempted. Its latency
     also feeds that model's routing estimate on success or timeout; fast
     error responses and connection failures don't, since their elapsed
-    time says nothing about how fast the model answers.
+    time says nothing about how fast the model answers. Each attempt also
+    updates that model's health: a success, or a failure if it failed
+    transiently. Non-transient errors (bad request, credentials, not
+    found) aren't model-health signals and are not recorded.
     """
     last_error: HTTPException | None = None
 
@@ -242,11 +258,13 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
             if not is_transient_provider_error(exc):
                 raise
 
+            record_failure(config.name)
             last_error = exc
             continue
 
         latency_ms = (time.perf_counter() - started_at) * 1000
         record_latency(config.name, latency_ms)
+        record_success(config.name)
 
         usage = response.usage
         RequestTelemetry(
@@ -281,8 +299,20 @@ async def stream_chat_completion(app: FastAPI, request: ChatRequest) -> AsyncIte
     No RequestTelemetry is emitted for streams yet -- latency and usage
     are only known after the response has started. See README. For the
     same reason streams read the latency estimates but never update them.
+
+    Health is updated from whether the stream *opened*: a success once the
+    provider accepted the connection, a failure on a transient pre-stream
+    error. What happens mid-stream is not recorded.
     """
     config = resolve_model(request)
     provider = _get_provider(app, config.provider)
 
-    return await provider.stream(_with_model(request, config))
+    try:
+        event_stream = await provider.stream(_with_model(request, config))
+    except HTTPException as exc:
+        if is_transient_provider_error(exc):
+            record_failure(config.name)
+        raise
+
+    record_success(config.name)
+    return event_stream
