@@ -75,3 +75,10 @@ def is_transient_provider_error(exc: HTTPException) -> bool:
         return upstream_status == 429 or upstream_status >= 500
 
     return True
+
+
+def is_timeout_provider_error(exc: HTTPException) -> bool:
+    """Whether a provider failure was Azir giving up waiting on the upstream
+    (as opposed to a fast error response or a failure to connect at all).
+    """
+    return isinstance(exc.__cause__, httpx.TimeoutException)

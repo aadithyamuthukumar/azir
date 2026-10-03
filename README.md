@@ -16,7 +16,7 @@ Azir currently supports:
 - Shared `httpx.AsyncClient`
 - A model registry (`model_registry.py`) as the single source of truth for routable models
 - Explicit model routing (e.g. `"model": "claude-sonnet-4-6"`)
-- Capability- and cost-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget)
+- Capability-, cost-, and latency-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget, optional `"routing_policy"`: `cheap`, `fast`, or `balanced` (default))
 - Fallback across providers on transient upstream failures (non-streaming)
 - Clean, normalized provider error handling
 - Per-attempt telemetry for non-streaming requests (provider, model, latency, token usage, status, estimated cost)
@@ -34,12 +34,16 @@ request.model
   +-- "azir-auto" --> task missing?                         -> 400
   |                   no enabled model has task?            -> 400
   |                   none within max_cost_usd (if given)?  -> 400
-  |                   else lowest estimated request cost
-  |                        (ties -> registry order)
+  |                   else rank the eligible models by routing_policy
+  |                        (default "balanced"; ties -> registry order):
+  |                          cheap    -> lowest estimated cost
+  |                          fast     -> lowest latency estimate
+  |                          balanced -> lowest normalized cost+latency score
   |
   +-- anything else --> not in registry?            -> 400 Unknown model
                         disabled?                   -> 400 Model is disabled
-                        else that registry entry (task / max_cost_usd don't affect it)
+                        else that registry entry (task / max_cost_usd /
+                        routing_policy don't affect it)
   |
   v
 concrete ModelConfig (name + provider)
@@ -61,7 +65,71 @@ Example with the current registry, for a 2-character prompt and no `max_tokens` 
 
 ```text
 claude-sonnet-4-6:  0.001 * 0.003   + 0.2 * 0.015  = 0.003003    USD
-gpt-4o-mini:        0.001 * 0.00015 + 0.2 * 0.0006 = 0.00012015  USD  <- selected
+gpt-4o-mini:        0.001 * 0.00015 + 0.2 * 0.0006 = 0.00012015  USD  <- cheaper
+```
+
+The cost estimate filters candidates by `max_cost_usd` for every policy, and is what `cheap` and `balanced` rank by (see "Routing policies" below).
+
+### Routing latency estimate (`azir-auto` only)
+
+`latency.py` keeps an in-memory exponentially weighted moving average (EWMA) of observed latency per concrete model:
+
+```text
+first sample:  estimate = sample
+afterwards:    estimate = 0.3 * sample + 0.7 * previous_estimate
+untried model: 1000 ms (DEFAULT_LATENCY_ESTIMATE_MS)
+```
+
+Samples come from non-streaming provider attempts in `route_request()` -- the same `latency_ms` telemetry reports:
+
+- successful attempts are recorded
+- timed-out attempts are recorded (the elapsed time is a lower bound on how slow the model was)
+- fast error responses (429, 5xx, 4xx) and connection failures are **not** recorded -- an instant 503 says nothing about how fast the model answers, and recording it would make a failing model look fast
+- requests rejected before any provider is called, and streams, record nothing
+
+An untried model sits at the 1000 ms default: it is neither assumed instant nor never tried -- a model observed slower than 1000 ms loses to it under `fast`, and it gets sampled.
+
+Example: after `claude-sonnet-4-6` has been observed at 400 ms then 600 ms, and `gpt-4o-mini` at 1500 ms then 1100 ms:
+
+```text
+claude-sonnet-4-6:  0.3 * 600  + 0.7 * 400  = 460 ms
+gpt-4o-mini:        0.3 * 1100 + 0.7 * 1500 = 1380 ms
+```
+
+State is per process and lost on restart; it is not persisted or shared between workers.
+
+### Routing policies (`azir-auto` only)
+
+Every policy ranks the **same** candidate set -- enabled models with the `task` capability that fit `max_cost_usd` -- and the lowest score wins. Exact ties go to registry order. No `routing_policy` means `balanced`.
+
+| Policy     | Score                                                                    |
+|------------|--------------------------------------------------------------------------|
+| `cheap`    | estimated request cost (latency is ignored)                              |
+| `fast`     | latency estimate, 1000 ms for untried models (cost is ignored beyond the budget filter) |
+| `balanced` | `0.5 * normalized_cost + 0.5 * normalized_latency`                       |
+
+`balanced` never adds dollars to milliseconds. Each metric is min-max normalized across the current candidates first:
+
+```text
+normalized = (value - min) / (max - min)      # 0 = best candidate, 1 = worst
+           = 0 for every candidate if all values are equal
+```
+
+The weights are `BALANCED_COST_WEIGHT` / `BALANCED_LATENCY_WEIGHT` in `router.py` (not configurable per request).
+
+**Cold start.** Untried models use the same 1000 ms default under `fast` and `balanced`. With no history at all, every latency is equal: `fast` falls back to registry order, and `balanced`'s latency term is 0 for everyone, so it picks the cheapest.
+
+**Two candidates.** With exactly two candidates each normalized metric is 0 or 1. If one model is both cheaper and faster, `balanced` picks it; if one is cheaper and the other faster, both score 0.5 and registry order decides. `balanced` only picks a "middle" model when there are three or more candidates.
+
+Example: three eligible models, a 2-character prompt with no `max_tokens` (estimated cost = 0.2 * output price):
+
+```text
+model   output $/1K  cost   latency   norm cost  norm latency  balanced
+A       1.0          0.2    900 ms    0.0        1.0           0.5
+B       2.0          0.4    400 ms    0.5        0.1667        0.3333
+C       3.0          0.6    300 ms    1.0        0.0           0.5
+
+cheap -> A      fast -> C      balanced -> B
 ```
 
 Resolution always happens before any provider is called, so providers, fallback, telemetry, and streaming only ever see concrete model names -- never `azir-auto`.
@@ -82,8 +150,8 @@ router.plan_attempts(...)  --> [resolved model, one fallback per other provider]
   |
   +--> attempt 1: provider.complete(concrete model)
   |       |
-  |       +-- success ----------------> emit telemetry --> ChatResponse
-  |       +-- transient failure ------> emit telemetry --> next attempt
+  |       +-- success ----------------> emit telemetry, record latency --> ChatResponse
+  |       +-- transient failure ------> emit telemetry (+ record latency if timeout) --> next attempt
   |       +-- non-recoverable failure -> emit telemetry --> raise immediately
   |
   +--> attempt 2 ... (same rules); if all fail transiently, re-raise the last error
@@ -121,7 +189,7 @@ router.resolve_model(...)              <-- same resolution as above; 400s happen
                  Client (incremental `data: {...}` chunks, ending in `data: [DONE]`)
 ```
 
-There is no cross-provider fallback and no telemetry on the streaming path -- see "Streaming" under Important Design Decisions and Current Limitations.
+Streams read the current latency estimates when resolving `azir-auto` but never update them. There is no cross-provider fallback and no telemetry on the streaming path -- see "Streaming" under Important Design Decisions and Current Limitations.
 
 ## Why Azir Exists
 
@@ -150,6 +218,8 @@ router.py
    |
    +--> model_registry.py
    |
+   +--> latency.py
+   |
    +--> AnthropicProvider
    |
    +--> OpenAIProvider
@@ -163,6 +233,7 @@ azir/
 ├── main.py
 ├── router.py
 ├── model_registry.py
+├── latency.py
 ├── telemetry.py
 ├── schemas.py
 ├── config.py
@@ -196,10 +267,11 @@ Owns the HTTP layer only:
 
 Defines Azir's request and response contracts using Pydantic: `Message`, `ChatRequest`, `ChatResponse`, `Choice`, `Usage`.
 
-`ChatRequest` fields: `model`, `messages`, `max_tokens`, `temperature`, `stream`, and the optional routing fields `task` and `max_cost_usd`. Neither routing field is ever forwarded to a provider.
+`ChatRequest` fields: `model`, `messages`, `max_tokens`, `temperature`, `stream`, and the optional routing fields `task`, `max_cost_usd`, and `routing_policy`. No routing field is ever forwarded to a provider.
 
 - `task` is required when `model` is `azir-auto`; when given, it also restricts which models may be used as fallbacks.
 - `max_cost_usd` (>= 0) caps the *estimated* request cost of every model Azir picks itself -- the `azir-auto` choice and any fallback. An explicitly named model is always honored regardless of it.
+- `routing_policy` (`cheap` | `fast` | `balanced`, default `balanced`) chooses how `azir-auto` ranks eligible models. It is ignored for explicitly named models. Any other value is rejected by validation (FastAPI's standard 422).
 
 ### `model_registry.py`
 
@@ -224,14 +296,28 @@ Currently registered:
 
 Models not in the registry are rejected with a 400 -- there is no `claude-*` / `gpt-*` prefix-based routing. To route to a new model, register it.
 
+### `latency.py`
+
+In-memory latency state keyed by concrete model name (see "Routing latency estimate" above for the formula):
+
+- `record_latency(model, latency_ms)` -- fold one observation into the model's EWMA
+- `get_latency_estimate(model)` -- current estimate in ms, or `None` if never observed
+- `get_latency_stats(model)` -- estimate plus sample count
+- `reset_latency()` -- clear everything (used by tests)
+
+Updates are synchronous and lock-guarded. Nothing is persisted.
+
 ### `router.py`
 
 Routing and orchestration:
 
 - `estimate_request_tokens(request)` / `estimate_request_cost_usd(request, config)` -- the pre-execution routing estimate described above
-- `resolve_model(request)` -- explicit model as-is, or for `azir-auto` + `task` the cheapest capable enabled model within `max_cost_usd` -> one `ModelConfig` (or a clean 400; a registry entry naming a provider Azir doesn't implement is a 500 configuration error)
+- `routing_latency_ms(config)` -- the model's latency estimate, or the cold-start default
+- `_eligible_candidates(request)` -- the shared `azir-auto` eligibility phase (task required, capability + enabled filter, budget filter, clean 400s)
+- `normalize(values)` / `select_by_policy(request, candidates)` -- rank the eligible candidates by `cheap`, `fast`, or `balanced` (see "Routing policies")
+- `resolve_model(request)` -- explicit model as-is, or for `azir-auto` the policy-selected eligible model -> one `ModelConfig` (or a clean 400; a registry entry naming a provider Azir doesn't implement is a 500 configuration error)
 - `plan_attempts(request)` -- the resolved model, then for each other provider in `PROVIDER_ORDER` the first enabled registry model of that provider (that also supports `task` and fits `max_cost_usd`, if given)
-- `route_request(app, request)` -- runs the plan for non-streaming requests, with fallback and per-attempt telemetry
+- `route_request(app, request)` -- runs the plan for non-streaming requests, with fallback, per-attempt telemetry, and latency recording
 - `stream_chat_completion(app, request)` -- resolves the model, then calls that provider's `stream()`; no fallback
 
 **Fallback policy.** `route_request()` moves to the next attempt only when `providers.errors.is_transient_provider_error()` says the failure is transient: rate limiting (429), provider unavailability / unexpected 5xx (500/502/503), and timeouts (504) or connection failures. Anything else is raised immediately without trying another provider:
@@ -258,6 +344,7 @@ stream(request: ChatRequest) -> AsyncIterator[str]
 
 - `raise_provider_error(exc, provider)` translates `httpx` failures into clean `HTTPException`s (no raw provider bodies, headers, or keys reach the client): 400/401/403/404/429 pass through, upstream 5xx and unrecognized statuses become 502, timeouts 504, connection failures 502.
 - `is_transient_provider_error(exc)` classifies those exceptions for the router's fallback policy (see above).
+- `is_timeout_provider_error(exc)` identifies timeouts, the only failures whose elapsed time is recorded as a latency sample.
 
 ### `providers/anthropic.py`
 
@@ -398,6 +485,20 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
+Automatic routing with an explicit policy (`cheap`, `fast`, or `balanced`):
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "azir-auto",
+    "task": "chat",
+    "routing_policy": "fast",
+    "messages": [{"role": "user", "content": "Say hello in one sentence."}],
+    "max_tokens": 50
+  }'
+```
+
 Every provider returns the same response shape (`model` is the name the provider reports):
 
 ```json
@@ -477,17 +578,18 @@ Azir does not yet support:
 - telemetry persistence or aggregation (records are logged, not stored)
 - billing-accurate cost tracking (only rough static rates from the registry)
 - accurate pre-execution token counts (routing uses a characters/4 heuristic)
-- cost-based ordering of fallbacks (fallbacks use registry order, filtered by task and budget)
+- cost- or latency-based ordering of fallbacks (fallbacks use registry order, filtered by task and budget)
+- persisted or shared latency history (estimates live in one process's memory and reset on restart)
+- latency samples from streaming requests
 - routing to models that aren't in the registry
 
 ## Future Work
 
 Not implemented today:
 
-1. Latency-aware routing
-2. Health-aware routing (provider health scoring, circuit breaking)
-3. Telemetry persistence and aggregation, including streaming telemetry
-4. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-aware selection)
+1. Health-aware routing (provider health scoring, circuit breaking)
+2. Telemetry persistence and aggregation, including streaming telemetry
+3. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-aware selection)
 
 ## License
 

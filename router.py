@@ -3,14 +3,23 @@ from typing import AsyncIterator
 
 from fastapi import FastAPI, HTTPException
 
+from latency import DEFAULT_LATENCY_ESTIMATE_MS, get_latency_estimate, record_latency
 from model_registry import ModelConfig, find_models, get_model
-from providers.errors import is_transient_provider_error
+from providers.errors import is_timeout_provider_error, is_transient_provider_error
 from schemas import ChatRequest, ChatResponse
 from telemetry import RequestTelemetry, estimate_cost_usd
 
-# Virtual model name: Azir picks the cheapest capable model from the
-# registry based on the request's `task`.
+# Virtual model name: Azir picks a capable model from the registry based on
+# the request's `task` and `routing_policy`.
 AUTO_MODEL = "azir-auto"
+
+# Policy used when an `azir-auto` request doesn't name one.
+DEFAULT_ROUTING_POLICY = "balanced"
+
+# Weights of the `balanced` score. Cost and latency are each min-max
+# normalized across the eligible candidates first, so these are unitless.
+BALANCED_COST_WEIGHT = 0.5
+BALANCED_LATENCY_WEIGHT = 0.5
 
 # Providers Azir has an implementation for, in the order they are tried
 # when falling back.
@@ -42,6 +51,14 @@ def estimate_request_cost_usd(request: ChatRequest, config: ModelConfig) -> floa
     return config.estimate_cost_usd(estimate_request_tokens(request), output_tokens)
 
 
+def routing_latency_ms(config: ModelConfig) -> float:
+    """The model's observed latency estimate, or the neutral cold-start
+    default if it has never been observed.
+    """
+    estimate = get_latency_estimate(config.name)
+    return DEFAULT_LATENCY_ESTIMATE_MS if estimate is None else estimate
+
+
 def _within_budget(request: ChatRequest, candidates: list[ModelConfig]) -> list[ModelConfig]:
     if request.max_cost_usd is None:
         return candidates
@@ -53,44 +70,89 @@ def _within_budget(request: ChatRequest, candidates: list[ModelConfig]) -> list[
     ]
 
 
+def _eligible_candidates(request: ChatRequest) -> list[ModelConfig]:
+    """The `azir-auto` candidate set every routing policy ranks: enabled
+    models with the `task` capability that fit `max_cost_usd` (if given),
+    in registry order. Raises a clean 400 if there are none.
+    """
+    if not request.task:
+        raise HTTPException(
+            status_code=400,
+            detail=f"'task' is required when model is '{AUTO_MODEL}'.",
+        )
+
+    candidates = find_models(capability=request.task)
+
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=f"No enabled model supports task: {request.task}",
+        )
+
+    candidates = _within_budget(request, candidates)
+
+    if not candidates:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"No enabled model supports task '{request.task}' within "
+                f"max_cost_usd={request.max_cost_usd}"
+            ),
+        )
+
+    return candidates
+
+
+def normalize(values: list[float]) -> list[float]:
+    """Min-max scale to [0, 1]: (value - min) / (max - min). If every value
+    is equal, each normalizes to 0 (no spread, so no preference).
+    """
+    low, high = min(values), max(values)
+
+    if high == low:
+        return [0.0] * len(values)
+
+    return [(value - low) / (high - low) for value in values]
+
+
+def select_by_policy(request: ChatRequest, candidates: list[ModelConfig]) -> ModelConfig:
+    """Pick one of the eligible `candidates` (registry order) by the
+    request's routing policy; lower score wins:
+
+    - cheap:    estimated request cost
+    - fast:     latency estimate (cold-start default for unobserved models)
+    - balanced: BALANCED_COST_WEIGHT * normalized cost
+                + BALANCED_LATENCY_WEIGHT * normalized latency
+    """
+    policy = request.routing_policy or DEFAULT_ROUTING_POLICY
+
+    if policy == "cheap":
+        scores = [estimate_request_cost_usd(request, c) for c in candidates]
+    elif policy == "fast":
+        scores = [routing_latency_ms(c) for c in candidates]
+    else:
+        costs = normalize([estimate_request_cost_usd(request, c) for c in candidates])
+        latencies = normalize([routing_latency_ms(c) for c in candidates])
+        scores = [
+            BALANCED_COST_WEIGHT * cost + BALANCED_LATENCY_WEIGHT * latency
+            for cost, latency in zip(costs, latencies)
+        ]
+
+    # min() keeps the first of equal scores, so ties fall to registry order.
+    best = min(range(len(candidates)), key=lambda i: scores[i])
+    return candidates[best]
+
+
 def resolve_model(request: ChatRequest) -> ModelConfig:
     """Resolve the request's model to one enabled, registered concrete
     model. The registry is the only source of truth: unknown or disabled
     models are rejected rather than guessed at.
 
-    An explicit model is used as-is. `azir-auto` picks, among enabled
-    models with the `task` capability that fit `max_cost_usd` (if given),
-    the one with the lowest estimated request cost; ties go to registry
-    order.
+    An explicit model is used as-is (`routing_policy` is ignored).
+    `azir-auto` ranks the eligible candidates with `select_by_policy`.
     """
     if request.model == AUTO_MODEL:
-        if not request.task:
-            raise HTTPException(
-                status_code=400,
-                detail=f"'task' is required when model is '{AUTO_MODEL}'.",
-            )
-
-        candidates = find_models(capability=request.task)
-
-        if not candidates:
-            raise HTTPException(
-                status_code=400,
-                detail=f"No enabled model supports task: {request.task}",
-            )
-
-        candidates = _within_budget(request, candidates)
-
-        if not candidates:
-            raise HTTPException(
-                status_code=400,
-                detail=(
-                    f"No enabled model supports task '{request.task}' within "
-                    f"max_cost_usd={request.max_cost_usd}"
-                ),
-            )
-
-        # min() keeps the first of equal keys, so ties fall to registry order.
-        config = min(candidates, key=lambda c: estimate_request_cost_usd(request, c))
+        config = select_by_policy(request, _eligible_candidates(request))
     else:
         config = get_model(request.model)
 
@@ -151,7 +213,10 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
     attempt fails transiently, the last error is re-raised.
 
     Each attempt (success or failure) emits a RequestTelemetry record for
-    the concrete provider/model that was actually attempted.
+    the concrete provider/model that was actually attempted. Its latency
+    also feeds that model's routing estimate on success or timeout; fast
+    error responses and connection failures don't, since their elapsed
+    time says nothing about how fast the model answers.
     """
     last_error: HTTPException | None = None
 
@@ -162,13 +227,17 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
         try:
             response = await provider.complete(_with_model(request, config))
         except HTTPException as exc:
+            latency_ms = (time.perf_counter() - started_at) * 1000
             RequestTelemetry(
                 provider=config.provider,
                 model=config.name,
                 status="error",
                 status_code=exc.status_code,
-                latency_ms=(time.perf_counter() - started_at) * 1000,
+                latency_ms=latency_ms,
             ).emit()
+
+            if is_timeout_provider_error(exc):
+                record_latency(config.name, latency_ms)
 
             if not is_transient_provider_error(exc):
                 raise
@@ -176,13 +245,16 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
             last_error = exc
             continue
 
+        latency_ms = (time.perf_counter() - started_at) * 1000
+        record_latency(config.name, latency_ms)
+
         usage = response.usage
         RequestTelemetry(
             provider=config.provider,
             model=config.name,
             status="success",
             status_code=200,
-            latency_ms=(time.perf_counter() - started_at) * 1000,
+            latency_ms=latency_ms,
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             total_tokens=usage.total_tokens,
@@ -207,7 +279,8 @@ async def stream_chat_completion(app: FastAPI, request: ChatRequest) -> AsyncIte
     surface as a normal HTTPException.
 
     No RequestTelemetry is emitted for streams yet -- latency and usage
-    are only known after the response has started. See README.
+    are only known after the response has started. See README. For the
+    same reason streams read the latency estimates but never update them.
     """
     config = resolve_model(request)
     provider = _get_provider(app, config.provider)

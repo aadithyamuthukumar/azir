@@ -62,6 +62,35 @@ def test_routing_errors_are_clean_400s(client, payload):
     assert "detail" in response.json()
 
 
+@pytest.mark.parametrize(
+    "policy, provider_attr, expected",
+    [
+        # cold start: every model sits at the default latency
+        ("cheap", "openai_provider", "gpt-4o-mini"),
+        ("fast", "anthropic_provider", "claude-sonnet-4-6"),
+        ("balanced", "openai_provider", "gpt-4o-mini"),
+    ],
+)
+def test_non_streaming_azir_auto_routing_policy(client, policy, provider_attr, expected):
+    response = client.post(
+        "/v1/chat/completions", json=body("azir-auto", task="chat", routing_policy=policy)
+    )
+
+    assert response.status_code == 200
+    assert getattr(app.state, provider_attr).requests[0].model == expected
+
+
+def test_invalid_routing_policy_is_rejected_before_routing(client):
+    response = client.post(
+        "/v1/chat/completions", json=body("azir-auto", task="chat", routing_policy="fastest")
+    )
+
+    # FastAPI's standard request-validation status, like any other invalid field
+    assert response.status_code == 422
+    assert not app.state.anthropic_provider.requests
+    assert not app.state.openai_provider.requests
+
+
 def test_streaming_azir_auto_returns_event_stream(client):
     response = client.post(
         "/v1/chat/completions", json=body("azir-auto", task="classification", stream=True)
