@@ -88,6 +88,8 @@ class ResponseEvaluation:
     score: float
     reason: str
     judge_telemetry_id: int | None = None
+    # the evaluated request's `task`, for task-specific routing quality
+    task: str | None = None
 
     def emit(self) -> None:
         logger.info(json.dumps({"evaluation": asdict(self)}))
@@ -225,6 +227,7 @@ async def _evaluate(app, request, config, response, telemetry_id) -> ResponseEva
         score=verdict.score,
         reason=verdict.reason,
         judge_telemetry_id=judge_telemetry_id,
+        task=request.task,
     )
     evaluation.emit()
 

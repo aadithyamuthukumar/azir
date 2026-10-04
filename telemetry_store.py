@@ -31,8 +31,24 @@ RETURNING id
 INSERT_EVALUATION_SQL = """
 INSERT INTO response_evaluations (
     telemetry_id, provider, model, judge_provider, judge_model,
-    score, reason, judge_telemetry_id
-) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+    score, reason, judge_telemetry_id, task
+) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+"""
+
+# Quality-aware routing: one grouped read for the whole candidate set
+# ($1 = model names, $2 = the request's task or NULL), with the same
+# plain AVG(score) the /v1/analytics/quality endpoint reports. A NULL $2
+# matches no rows, so task_count is then 0.
+QUALITY_HISTORY_SQL = """
+SELECT
+    model,
+    COUNT(*) AS overall_count,
+    AVG(score) AS overall_average,
+    COUNT(*) FILTER (WHERE task = $2) AS task_count,
+    AVG(score) FILTER (WHERE task = $2) AS task_average
+FROM response_evaluations
+WHERE model = ANY($1)
+GROUP BY model
 """
 
 # Upper bound on one analytics query. Unlike writes, a failed read fails
@@ -136,6 +152,7 @@ class TelemetryStore:
                 evaluation.score,
                 evaluation.reason,
                 evaluation.judge_telemetry_id,
+                evaluation.task,
             ),
             timeout=WRITE_TIMEOUT_SECONDS,
         )
@@ -157,6 +174,15 @@ class TelemetryStore:
     async def fetch_quality_stats(self) -> list[dict]:
         rows = await asyncio.wait_for(self._pool.fetch(QUALITY_STATS_SQL), timeout=READ_TIMEOUT_SECONDS)
         return [dict(row) for row in rows]
+
+    async def fetch_quality_history(self, models: list[str], task: str | None) -> dict[str, dict]:
+        """Evaluation counts and averages per model (overall and for
+        `task`), keyed by model name; models without evaluations are
+        absent. Routing bounds this call more tightly (see quality.py)."""
+        rows = await asyncio.wait_for(
+            self._pool.fetch(QUALITY_HISTORY_SQL, models, task), timeout=READ_TIMEOUT_SECONDS
+        )
+        return {row["model"]: dict(row) for row in rows}
 
     async def close(self) -> None:
         await self._pool.close()

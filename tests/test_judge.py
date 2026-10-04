@@ -279,6 +279,7 @@ async def test_evaluation_is_persisted_with_concrete_models_and_linked_telemetry
             0.87,
             "Correct and relevant, but omitted one requested edge case.",
             2,  # judge_telemetry_id
+            "coding",  # the request's task, for task-specific routing quality
         )
     ]
 

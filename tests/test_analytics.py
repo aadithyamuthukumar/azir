@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import re
 import sqlite3
@@ -58,6 +59,7 @@ class SqlitePool:
                 telemetry_id       INTEGER REFERENCES request_telemetry (id),
                 provider           TEXT NOT NULL,
                 model              TEXT NOT NULL,
+                task               TEXT,
                 judge_provider     TEXT NOT NULL,
                 judge_model        TEXT NOT NULL,
                 score              DOUBLE PRECISION NOT NULL CHECK (score >= 0 AND score <= 1),
@@ -88,8 +90,12 @@ class SqlitePool:
         return self
 
     def _run(self, query: str, args: tuple = ()):
-        # asyncpg placeholders ($1, $2, ...) -> sqlite's positional "?"
-        return self.db.execute(re.sub(r"\$\d+", "?", query), args)
+        # Postgres array match -> SQLite JSON-array membership (the one
+        # non-portable construct, used by the routing quality lookup)
+        query = query.replace("= ANY($1)", "IN (SELECT value FROM json_each($1))")
+        args = tuple(json.dumps(arg) if isinstance(arg, list) else arg for arg in args)
+        # asyncpg placeholders ($1, $2, ...) -> sqlite's numbered "?NNN"
+        return self.db.execute(re.sub(r"\$(\d+)", r"?\1", query), args)
 
     async def _before(self, query: str):
         self.queries.append(query)

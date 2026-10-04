@@ -16,7 +16,7 @@ Azir currently supports:
 - Shared `httpx.AsyncClient`
 - A model registry (`model_registry.py`) as the single source of truth for routable models
 - Explicit model routing (e.g. `"model": "claude-sonnet-4-6"`)
-- Capability-, cost-, and latency-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget, optional `"routing_policy"`: `cheap`, `fast`, or `balanced` (default)), skipping models that have been failing recently (health-aware)
+- Capability-, cost-, latency-, and quality-aware automatic routing (`"model": "azir-auto"` plus `"task"`, optional `"max_cost_usd"` budget, optional `"routing_policy"`: `cheap`, `fast`, `quality`, or `balanced` (default)), skipping models that have been failing recently (health-aware); quality comes from historical LLM-as-a-judge scores
 - Fallback across providers on transient upstream failures (non-streaming)
 - Clean, normalized provider error handling
 - Per-attempt telemetry for non-streaming requests (provider, model, latency, token usage, status, estimated cost), logged and optionally persisted to PostgreSQL
@@ -37,16 +37,20 @@ request.model
   |                   no enabled model has task?            -> 400
   |                   none within max_cost_usd (if given)?  -> 400
   |                   drop unhealthy models (unless all are unhealthy)
+  |                   quality / balanced: load historical quality for the
+  |                        remaining models (one DB read; 0.5 on failure)
   |                   rank the remaining models by routing_policy
   |                        (default "balanced"; ties -> registry order):
   |                          cheap    -> lowest estimated cost
   |                          fast     -> lowest latency estimate
-  |                          balanced -> lowest normalized cost+latency score
+  |                          quality  -> highest historical quality
+  |                          balanced -> lowest normalized cost + latency
+  |                                      + quality-penalty score
   |
   +-- anything else --> not in registry?            -> 400 Unknown model
                         disabled?                   -> 400 Model is disabled
                         else that registry entry (task / max_cost_usd /
-                        routing_policy / health don't affect it)
+                        routing_policy / health / quality don't affect it)
   |
   v
 concrete ModelConfig (name + provider)
@@ -101,38 +105,71 @@ gpt-4o-mini:        0.3 * 1100 + 0.7 * 1500 = 1380 ms
 
 State is per process and lost on restart; it is not persisted or shared between workers.
 
+### Routing quality estimate (`azir-auto`, `quality` and `balanced` only)
+
+`quality.py` turns **historical LLM-as-a-judge scores** (the `response_evaluations` table, see "LLM-as-a-judge quality evaluation") into one 0-1 quality estimate per candidate. Nothing is judged during routing and no extra provider call is made: a score persisted for an earlier request can steer later ones.
+
+```text
+request A --> model response --> judge score persisted
+later request B --> router reads historical scores --> quality-aware selection
+```
+
+For each candidate model:
+
+1. the model's average score **for the request's `task`**, if it has at least 5 (`MIN_QUALITY_SAMPLES`) evaluations for that task
+2. otherwise its **overall** average score, if it has at least 5 evaluations in total (rows of any task, including rows stored before `task` was recorded)
+3. otherwise **0.5** (`DEFAULT_QUALITY_SCORE`) -- neutral cold start: an unjudged model is neither punished as bad nor rewarded as good
+
+The averages are the same plain `AVG(score)` that `/v1/analytics/quality` reports, computed in Postgres in **one grouped query for the whole candidate set** (`TelemetryStore.fetch_quality_history`), never row by row in Python:
+
+```sql
+SELECT model,
+       COUNT(*) AS overall_count, AVG(score) AS overall_average,
+       COUNT(*) FILTER (WHERE task = $2) AS task_count,
+       AVG(score) FILTER (WHERE task = $2) AS task_average
+FROM response_evaluations
+WHERE model = ANY($1)          -- the candidate names
+GROUP BY model
+```
+
+**Failure is not fatal.** If `DATABASE_URL` is unset, or the lookup fails or takes longer than `QUALITY_LOOKUP_TIMEOUT_SECONDS` (0.5 s), every candidate gets 0.5, the failure is logged on `azir.quality`, and routing continues -- automatic routing never fails because quality history is unavailable. With all-neutral quality, `quality` falls back to registry order and `balanced` ranks exactly as cost + latency.
+
+The lookup runs once per request, before selection, only for `azir-auto` with `quality` or `balanced` (the default) -- not for explicit models, `cheap`, `fast`, or fallback attempts. That means one small database read per default `azir-auto` request when `DATABASE_URL` is set.
+
 ### Routing policies (`azir-auto` only)
 
-Every policy ranks the **same** candidate set -- enabled models with the `task` capability that fit `max_cost_usd`, minus unhealthy ones (see "Model health" below) -- and the lowest score wins. Exact ties go to registry order. No `routing_policy` means `balanced`.
+Every policy ranks the **same** candidate set -- enabled models with the `task` capability that fit `max_cost_usd`, minus unhealthy ones (see "Model health" below) -- and the lowest score wins. Exact ties go to registry order. No `routing_policy` means `balanced`. Health is an eligibility filter, never part of a score.
 
-| Policy     | Score                                                                    |
+| Policy     | Score (lower wins)                                                       |
 |------------|--------------------------------------------------------------------------|
-| `cheap`    | estimated request cost (latency is ignored)                              |
-| `fast`     | latency estimate, 1000 ms for untried models (cost is ignored beyond the budget filter) |
-| `balanced` | `0.5 * normalized_cost + 0.5 * normalized_latency`                       |
+| `cheap`    | estimated request cost (latency and quality are ignored)                 |
+| `fast`     | latency estimate, 1000 ms for untried models (cost and quality are ignored beyond the budget filter) |
+| `quality`  | `-quality_estimate`, i.e. the highest historical quality wins (cost and latency are ignored beyond the budget filter) |
+| `balanced` | `0.33 * normalized_cost + 0.33 * normalized_latency + 0.34 * (1 - quality_estimate)` |
 
-`balanced` never adds dollars to milliseconds. Each metric is min-max normalized across the current candidates first:
+`balanced` never adds dollars to milliseconds. Cost and latency are min-max normalized across the current candidates first; quality is already 0-1 and enters as the penalty `1 - quality`:
 
 ```text
 normalized = (value - min) / (max - min)      # 0 = best candidate, 1 = worst
            = 0 for every candidate if all values are equal
 ```
 
-The weights are `BALANCED_COST_WEIGHT` / `BALANCED_LATENCY_WEIGHT` in `router.py` (not configurable per request).
+The weights are `BALANCED_COST_WEIGHT` / `BALANCED_LATENCY_WEIGHT` / `BALANCED_QUALITY_WEIGHT` in `router.py` (not configurable per request).
 
-**Cold start.** Untried models use the same 1000 ms default under `fast` and `balanced`. With no history at all, every latency is equal: `fast` falls back to registry order, and `balanced`'s latency term is 0 for everyone, so it picks the cheapest.
+**Cold start.** Untried models use the same 1000 ms latency default under `fast` and `balanced`, and the neutral 0.5 quality under `quality` and `balanced`. With no history at all, every latency and quality is equal: `fast` and `quality` fall back to registry order, and `balanced` picks the cheapest.
 
-**Two candidates.** With exactly two candidates each normalized metric is 0 or 1. If one model is both cheaper and faster, `balanced` picks it; if one is cheaper and the other faster, both score 0.5 and registry order decides. `balanced` only picks a "middle" model when there are three or more candidates.
+**Two candidates.** With exactly two candidates each normalized metric is 0 or 1, so the full cost or latency gap is worth 0.33, while a quality gap is worth `0.34 * (q1 - q2)`. With neutral quality, if one model is cheaper and the other faster, they tie and registry order decides. `balanced` only picks a "middle" model when there are three or more candidates.
 
-Example: three eligible models, a 2-character prompt with no `max_tokens` (estimated cost = 0.2 * output price):
+Example: four eligible models, a 2-character prompt with no `max_tokens` (estimated cost = 0.2 * output price), with enough judge history for the quality shown:
 
 ```text
-model   output $/1K  cost   latency   norm cost  norm latency  balanced
-A       1.0          0.2    900 ms    0.0        1.0           0.5
-B       2.0          0.4    400 ms    0.5        0.1667        0.3333
-C       3.0          0.6    300 ms    1.0        0.0           0.5
+model       cost  latency  quality  norm cost  norm latency  penalty  balanced
+budget      0.2   900 ms   0.40     0.00       0.875         0.60     0.33*0.00 + 0.33*0.875 + 0.34*0.60 = 0.4928
+speedy      0.8   200 ms   0.50     0.75       0.000         0.50     0.33*0.75 + 0.33*0.000 + 0.34*0.50 = 0.4175
+premium     1.0   1000 ms  0.95     1.00       1.000         0.05     0.33*1.00 + 0.33*1.000 + 0.34*0.05 = 0.6770
+allrounder  0.4   400 ms   0.80     0.25       0.250         0.20     0.33*0.25 + 0.33*0.250 + 0.34*0.20 = 0.2330
 
-cheap -> A      fast -> C      balanced -> B
+cheap -> budget   fast -> speedy   quality -> premium   balanced -> allrounder
 ```
 
 ### Model health (`azir-auto` only)
@@ -160,10 +197,10 @@ What is recorded, at the same per-attempt point as telemetry and fallback:
 
 How it affects routing:
 
-- **`azir-auto`:** unhealthy models are removed after the budget filter, before the routing policy ranks what is left. `balanced` normalizes across the healthy candidates only.
+- **`azir-auto`:** unhealthy models are removed after the budget filter, before quality is looked up and the routing policy ranks what is left. `balanced` normalizes across the healthy candidates only.
 - **Every eligible model unhealthy:** the filter is skipped and the policy ranks the full eligible set, exactly as if there were no health state. Azir never returns a 400 just because of health; a failing primary still falls back normally.
 - **Explicit models** are always used, healthy or not.
-- **Fallbacks** keep their existing rule (first enabled model per other provider that fits `task` and budget). Health does not filter them.
+- **Fallbacks** keep their existing rule (first enabled model per other provider that fits `task` and budget). Health and quality do not filter or reorder them; the policy only picks the primary.
 
 Example, `task: "chat"`, `routing_policy: "cheap"`, after `gpt-4o-mini` recorded 2 successes and 4 failures (2/6 = 0.33 < 0.6, unhealthy) and `claude-sonnet-4-6` 3 successes (fewer than 5 samples, healthy):
 
@@ -269,6 +306,8 @@ router.py
    |
    +--> health.py
    |
+   +--> quality.py (historical judge scores, via telemetry_store.py)
+   |
    +--> AnthropicProvider
    |
    +--> OpenAIProvider
@@ -289,6 +328,7 @@ azir/
 ├── model_registry.py
 ├── latency.py
 ├── health.py
+├── quality.py
 ├── telemetry.py
 ├── telemetry_store.py
 ├── judge.py
@@ -330,7 +370,7 @@ Defines Azir's request and response contracts using Pydantic: `Message`, `ChatRe
 
 - `task` is required when `model` is `azir-auto`; when given, it also restricts which models may be used as fallbacks.
 - `max_cost_usd` (>= 0) caps the *estimated* request cost of every model Azir picks itself -- the `azir-auto` choice and any fallback. An explicitly named model is always honored regardless of it.
-- `routing_policy` (`cheap` | `fast` | `balanced`, default `balanced`) chooses how `azir-auto` ranks eligible models. It is ignored for explicitly named models. Any other value is rejected by validation (FastAPI's standard 422).
+- `routing_policy` (`cheap` | `fast` | `quality` | `balanced`, default `balanced`) chooses how `azir-auto` ranks eligible models. It is ignored for explicitly named models. Any other value is rejected by validation (FastAPI's standard 422).
 
 ### `model_registry.py`
 
@@ -378,6 +418,14 @@ In-memory rolling window of recent provider outcomes per concrete model (see "Mo
 
 Health state is the router's current signal; telemetry is the separate historical event log. Neither is derived from the other.
 
+### `quality.py`
+
+Historical quality estimates for routing (see "Routing quality estimate" above). Unlike latency and health, nothing is kept in memory: estimates are read from Postgres per request.
+
+- `MIN_QUALITY_SAMPLES = 5`, `DEFAULT_QUALITY_SCORE = 0.5`, `QUALITY_LOOKUP_TIMEOUT_SECONDS = 0.5`
+- `quality_from_history(row, task)` -- task average -> overall average -> 0.5, by the sample thresholds
+- `load_quality_estimates(store, models, task)` -- one `fetch_quality_history` call for all candidates; never raises (neutral estimates on any failure)
+
 ### `router.py`
 
 Routing and orchestration:
@@ -386,7 +434,9 @@ Routing and orchestration:
 - `routing_latency_ms(config)` -- the model's latency estimate, or the cold-start default
 - `_eligible_candidates(request)` -- the shared `azir-auto` eligibility phase (task required, capability + enabled filter, budget filter, clean 400s)
 - `_prefer_healthy(candidates)` -- drop unhealthy candidates, unless that would drop all of them
-- `normalize(values)` / `select_by_policy(request, candidates)` -- rank the eligible candidates by `cheap`, `fast`, or `balanced` (see "Routing policies")
+- `auto_candidates(request)` -- the eligible, health-filtered `azir-auto` candidates
+- `load_routing_quality(app, request)` -- for `azir-auto` with `quality` / `balanced`, the candidates' historical quality estimates via `quality.load_quality_estimates()` (one DB read, neutral on failure); `None` otherwise
+- `normalize(values)` / `select_by_policy(request, candidates, quality)` -- rank the eligible candidates by `cheap`, `fast`, `quality`, or `balanced` (see "Routing policies")
 - `resolve_model(request)` -- explicit model as-is, or for `azir-auto` the policy-selected eligible model -> one `ModelConfig` (or a clean 400; a registry entry naming a provider Azir doesn't implement is a 500 configuration error)
 - `plan_attempts(request)` -- the resolved model, then for each other provider in `PROVIDER_ORDER` the first enabled registry model of that provider (that also supports `task` and fits `max_cost_usd`, if given)
 - `route_request(app, request, background_tasks=None)` -- runs the plan for non-streaming requests, with fallback, per-attempt telemetry, and latency and health recording; on success, queues an LLM-judge evaluation on `background_tasks` when judging is enabled (`main.py` passes FastAPI's `BackgroundTasks`; internal callers pass none and are never judged)
@@ -467,6 +517,7 @@ Optional Postgres persistence of the same records, using `asyncpg`:
 - `open_telemetry_store(database_url)` -- called once at startup: creates one shared connection pool and applies `schema.sql`. Returns `None` (log-only) if `DATABASE_URL` is unset.
 - `TelemetryStore.save(record)` -- inserts one row and returns its `id`, bounded by `WRITE_TIMEOUT_SECONDS` (2 s)
 - `TelemetryStore.save_evaluation(evaluation)` -- inserts one `response_evaluations` row, same bound
+- `TelemetryStore.fetch_quality_history(models, task)` -- per-model evaluation counts and averages (overall and for `task`) for quality-aware routing, one grouped query
 - `TelemetryStore.fetch_summary()` / `fetch_model_stats()` / `fetch_provider_stats()` / `fetch_quality_stats()` -- read-only aggregates for the analytics API, on the same pool, bounded by `READ_TIMEOUT_SECONDS` (5 s)
 - `TelemetryStore.close()` -- closes the pool on shutdown
 
@@ -497,6 +548,7 @@ Table `response_evaluations` (one row per LLM-judge verdict, see "LLM-as-a-judge
 | `telemetry_id`       | `BIGINT`           | yes   | `request_telemetry.id` of the evaluated attempt; `NULL` if that telemetry write failed |
 | `provider`           | `TEXT`             | no    | concrete provider of the evaluated response |
 | `model`              | `TEXT`             | no    | concrete model of the evaluated response (never `azir-auto`) |
+| `task`               | `TEXT`             | yes   | the evaluated request's `task`, `NULL` if none; added with `ADD COLUMN IF NOT EXISTS` to existing tables (older rows stay `NULL` and still count toward overall quality) |
 | `judge_provider`     | `TEXT`             | no    | |
 | `judge_model`        | `TEXT`             | no    | |
 | `score`              | `DOUBLE PRECISION` | no    | `CHECK (score >= 0 AND score <= 1)` |
@@ -541,7 +593,7 @@ The analytics endpoints have no authentication either (see Security), and they r
 
 ### LLM-as-a-judge quality evaluation (`judge.py`)
 
-When `LLM_JUDGE_ENABLED=true`, every successful non-streaming response is scored by a second LLM, `LLM_JUDGE_MODEL`. The score is an evaluation signal only: **it never changes the response and does not affect routing** (`cheap` / `fast` / `balanced` and health are untouched).
+When `LLM_JUDGE_ENABLED=true`, every successful non-streaming response is scored by a second LLM, `LLM_JUDGE_MODEL`. The score never changes the response it grades. Once persisted, it feeds the historical quality estimates that the `quality` and `balanced` routing policies use for **later** requests (see "Routing quality estimate"); judging never happens during routing.
 
 Flow:
 
@@ -710,7 +762,37 @@ curl -X POST http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Automatic routing with an explicit policy (`cheap`, `fast`, or `balanced`):
+Automatic routing by historical quality (highest average LLM-judge score for this task among capable, healthy models within budget; 0.5 for models with fewer than 5 evaluations):
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "azir-auto",
+    "task": "coding",
+    "routing_policy": "quality",
+    "messages": [{"role": "user", "content": "Write a Python function that reverses a linked list."}],
+    "max_tokens": 300
+  }'
+```
+
+`balanced` (also the default when `routing_policy` is omitted) weighs cost, latency, and quality:
+
+```bash
+curl -X POST http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "azir-auto",
+    "task": "chat",
+    "routing_policy": "balanced",
+    "messages": [{"role": "user", "content": "Summarize the plot of Hamlet in two sentences."}],
+    "max_tokens": 100
+  }'
+```
+
+Quality-aware selection needs `DATABASE_URL` and judge history (`LLM_JUDGE_ENABLED=true` on earlier requests); without them every model is at the neutral 0.5.
+
+Automatic routing with another explicit policy (`cheap` or `fast`):
 
 ```bash
 curl -X POST http://127.0.0.1:8000/v1/chat/completions \
@@ -911,7 +993,7 @@ Azir does not yet support:
 - telemetry dashboards or charts (the analytics API returns all-time JSON aggregates only: no time ranges, filters, or pagination)
 - streaming requests in the analytics (they produce no telemetry yet)
 - LLM-judge evaluation of streaming responses
-- quality-aware routing (judge scores are recorded but never influence model selection)
+- learned or per-request `balanced` weights, or confidence-aware quality (a model's average is used as-is once it has 5 evaluations; older and newer scores count equally)
 - more than one judge per response, or per-dimension quality scores (one overall 0-1 score and reason); judge calls have no fallback or retry, and the judge may be the same model it is grading
 - prompt-size limits for the judge (the whole conversation is sent)
 - schema migrations beyond the idempotent `schema.sql`
@@ -929,7 +1011,7 @@ Not implemented today:
 
 1. Richer health handling (time-based circuit breaking, active probes, health-filtered fallbacks)
 2. Streaming telemetry (and with it, streaming analytics), and time-windowed analytics queries
-3. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-aware selection using the recorded judge scores)
+3. More advanced routing/fallback policies (per-provider retries, streaming fallback, richer task selection, quality-ordered fallbacks, time-decayed quality history)
 
 ## License
 

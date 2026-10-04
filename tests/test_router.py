@@ -335,18 +335,19 @@ def test_max_cost_usd_rejects_negative_values():
 
 # --- Routing policies ---
 
-POLICIES = ["cheap", "fast", "balanced"]
+POLICIES = ["cheap", "fast", "balanced", "quality"]
 
 
 @pytest.fixture
 def three_models(registry):
     """Three eligible coding models. With "hi" + 200 default output tokens
-    (input is free), estimated cost is 0.2 * output_cost:
+    (input is free), estimated cost is 0.2 * output_cost. Without quality
+    history every model is at the neutral 0.5 (penalty 0.34 * 0.5 = 0.17):
 
         model    cost   latency   norm cost   norm latency   balanced
-        cheap    0.2    900 ms    0.0         1.0            0.5
-        middle   0.4    400 ms    0.5         0.1667         0.3333
-        quick    0.6    300 ms    1.0         0.0            0.5
+        cheap    0.2    900 ms    0.0         1.0            0.33 + 0.17 = 0.50
+        middle   0.4    400 ms    0.5         0.1667         0.22 + 0.17 = 0.39
+        quick    0.6    300 ms    1.0         0.0            0.33 + 0.17 = 0.50
     """
     registry(
         model("cheap", provider="openai", input_cost=0.0, output_cost=1.0),
@@ -506,8 +507,8 @@ def test_balanced_cold_start_with_real_registry_picks_cheapest():
 
 
 def test_balanced_ties_go_to_registry_order(cheap_slow_vs_pricey_fast, registry):
-    # two candidates, one cheaper and one faster: each normalizes to
-    # 0.5 * 0 + 0.5 * 1 = 0.5, so registry order decides
+    # two candidates, one cheaper and one faster, equal (neutral) quality:
+    # each scores 0.33 * 0 + 0.33 * 1 + 0.34 * 0.5, so registry order decides
     assert resolve_model(cost_request(routing_policy="balanced")).name == "cheap-slow"
 
     registry(
@@ -1006,7 +1007,7 @@ async def test_route_request_records_nothing_when_no_provider_is_called():
 
 
 # claude-sonnet-4-6 observed at 200 ms, gpt-4o-mini at 900 ms; gpt-4o-mini is cheaper.
-# balanced: one model is cheaper, the other faster -> 0.5 each -> registry order (claude).
+# balanced: one model is cheaper, the other faster, quality neutral -> tie -> registry order (claude).
 POLICY_PRIMARY = [
     ("cheap", OPENAI_MODEL, ANTHROPIC_MODEL),
     ("fast", ANTHROPIC_MODEL, OPENAI_MODEL),

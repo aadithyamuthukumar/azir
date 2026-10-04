@@ -8,6 +8,7 @@ from judge import schedule_evaluation
 from latency import DEFAULT_LATENCY_ESTIMATE_MS, get_latency_estimate, record_latency
 from model_registry import ModelConfig, find_models, get_model
 from providers.errors import is_timeout_provider_error, is_transient_provider_error
+from quality import DEFAULT_QUALITY_SCORE, load_quality_estimates
 from schemas import ChatRequest, ChatResponse
 from telemetry import RequestTelemetry, estimate_cost_usd, publish
 
@@ -19,9 +20,14 @@ AUTO_MODEL = "azir-auto"
 DEFAULT_ROUTING_POLICY = "balanced"
 
 # Weights of the `balanced` score. Cost and latency are each min-max
-# normalized across the eligible candidates first, so these are unitless.
-BALANCED_COST_WEIGHT = 0.5
-BALANCED_LATENCY_WEIGHT = 0.5
+# normalized across the eligible candidates first, and quality enters as
+# the penalty 1 - quality (already 0-1), so these are unitless.
+BALANCED_COST_WEIGHT = 0.33
+BALANCED_LATENCY_WEIGHT = 0.33
+BALANCED_QUALITY_WEIGHT = 0.34
+
+# Policies that rank on historical quality, so need it looked up first.
+QUALITY_POLICIES = {"quality", "balanced"}
 
 # Providers Azir has an implementation for, in the order they are tried
 # when falling back.
@@ -115,6 +121,12 @@ def _prefer_healthy(candidates: list[ModelConfig]) -> list[ModelConfig]:
     return healthy or candidates
 
 
+def auto_candidates(request: ChatRequest) -> list[ModelConfig]:
+    """The candidates an `azir-auto` policy ranks: capability, budget,
+    then health filtered (see the two helpers above)."""
+    return _prefer_healthy(_eligible_candidates(request))
+
+
 def normalize(values: list[float]) -> list[float]:
     """Min-max scale to [0, 1]: (value - min) / (max - min). If every value
     is equal, each normalizes to 0 (no spread, so no preference).
@@ -127,27 +139,42 @@ def normalize(values: list[float]) -> list[float]:
     return [(value - low) / (high - low) for value in values]
 
 
-def select_by_policy(request: ChatRequest, candidates: list[ModelConfig]) -> ModelConfig:
+def select_by_policy(
+    request: ChatRequest,
+    candidates: list[ModelConfig],
+    quality: dict[str, float] | None = None,
+) -> ModelConfig:
     """Pick one of the eligible `candidates` (registry order) by the
     request's routing policy; lower score wins:
 
     - cheap:    estimated request cost
     - fast:     latency estimate (cold-start default for unobserved models)
+    - quality:  -quality estimate, i.e. the highest quality wins
     - balanced: BALANCED_COST_WEIGHT * normalized cost
                 + BALANCED_LATENCY_WEIGHT * normalized latency
+                + BALANCED_QUALITY_WEIGHT * (1 - quality estimate)
+
+    `quality` maps model name -> historical quality estimate (see
+    quality.py); models missing from it use DEFAULT_QUALITY_SCORE.
     """
     policy = request.routing_policy or DEFAULT_ROUTING_POLICY
+    quality = quality or {}
+    qualities = [quality.get(c.name, DEFAULT_QUALITY_SCORE) for c in candidates]
 
     if policy == "cheap":
         scores = [estimate_request_cost_usd(request, c) for c in candidates]
     elif policy == "fast":
         scores = [routing_latency_ms(c) for c in candidates]
+    elif policy == "quality":
+        scores = [-q for q in qualities]
     else:
         costs = normalize([estimate_request_cost_usd(request, c) for c in candidates])
         latencies = normalize([routing_latency_ms(c) for c in candidates])
         scores = [
-            BALANCED_COST_WEIGHT * cost + BALANCED_LATENCY_WEIGHT * latency
-            for cost, latency in zip(costs, latencies)
+            BALANCED_COST_WEIGHT * cost
+            + BALANCED_LATENCY_WEIGHT * latency
+            + BALANCED_QUALITY_WEIGHT * (1.0 - q)
+            for cost, latency, q in zip(costs, latencies, qualities)
         ]
 
     # min() keeps the first of equal scores, so ties fall to registry order.
@@ -155,18 +182,19 @@ def select_by_policy(request: ChatRequest, candidates: list[ModelConfig]) -> Mod
     return candidates[best]
 
 
-def resolve_model(request: ChatRequest) -> ModelConfig:
+def resolve_model(request: ChatRequest, quality: dict[str, float] | None = None) -> ModelConfig:
     """Resolve the request's model to one enabled, registered concrete
     model. The registry is the only source of truth: unknown or disabled
     models are rejected rather than guessed at.
 
-    An explicit model is used as-is (`routing_policy` and health are
-    ignored). `azir-auto` ranks the eligible candidates -- minus unhealthy
-    ones, unless all are unhealthy -- with `select_by_policy`.
+    An explicit model is used as-is (`routing_policy`, health, and quality
+    are ignored). `azir-auto` ranks the eligible candidates -- minus
+    unhealthy ones, unless all are unhealthy -- with `select_by_policy`,
+    using the `quality` estimates from `load_routing_quality` (neutral if
+    not given).
     """
     if request.model == AUTO_MODEL:
-        candidates = _prefer_healthy(_eligible_candidates(request))
-        config = select_by_policy(request, candidates)
+        config = select_by_policy(request, auto_candidates(request), quality)
     else:
         config = get_model(request.model)
 
@@ -191,13 +219,14 @@ def resolve_model(request: ChatRequest) -> ModelConfig:
     return config
 
 
-def plan_attempts(request: ChatRequest) -> list[ModelConfig]:
+def plan_attempts(request: ChatRequest, quality: dict[str, float] | None = None) -> list[ModelConfig]:
     """The resolved primary model, followed by one fallback model per
     remaining provider in `PROVIDER_ORDER` -- the first enabled registry
     model for that provider that also supports `request.task`, if given,
-    and fits `request.max_cost_usd`, if given.
+    and fits `request.max_cost_usd`, if given. Quality only picks the
+    primary; fallbacks keep registry order.
     """
-    primary = resolve_model(request)
+    primary = resolve_model(request, quality)
     attempts = [primary]
 
     for name in PROVIDER_ORDER:
@@ -218,6 +247,24 @@ def _get_provider(app: FastAPI, name: str):
 def _telemetry_sink(app: FastAPI):
     # None when persistence isn't configured: telemetry is then only logged.
     return getattr(app.state, "telemetry_store", None)
+
+
+async def load_routing_quality(app: FastAPI, request: ChatRequest) -> dict[str, float] | None:
+    """Historical quality estimates for the `azir-auto` candidates, from
+    one database read -- only when the policy ranks on quality. Explicit
+    models and `cheap` / `fast` never touch the database here. A failed
+    lookup yields neutral estimates (see quality.py), never an error.
+    """
+    if request.model != AUTO_MODEL:
+        return None
+
+    if (request.routing_policy or DEFAULT_ROUTING_POLICY) not in QUALITY_POLICIES:
+        return None
+
+    candidates = auto_candidates(request)
+    return await load_quality_estimates(
+        _telemetry_sink(app), [config.name for config in candidates], request.task
+    )
 
 
 def _with_model(request: ChatRequest, config: ModelConfig) -> ChatRequest:
@@ -251,7 +298,7 @@ async def route_request(
     """
     last_error: HTTPException | None = None
 
-    for config in plan_attempts(request):
+    for config in plan_attempts(request, await load_routing_quality(app, request)):
         provider = _get_provider(app, config.provider)
         started_at = time.perf_counter()
 
@@ -325,8 +372,11 @@ async def stream_chat_completion(app: FastAPI, request: ChatRequest) -> AsyncIte
     Health is updated from whether the stream *opened*: a success once the
     provider accepted the connection, a failure on a transient pre-stream
     error. What happens mid-stream is not recorded.
+
+    Selection uses the same persisted quality history as `route_request`;
+    streams themselves are never judged.
     """
-    config = resolve_model(request)
+    config = resolve_model(request, await load_routing_quality(app, request))
     provider = _get_provider(app, config.provider)
 
     try:

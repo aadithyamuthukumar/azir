@@ -16,6 +16,7 @@ class FakePool:
         self.error = error
         self.delay = delay
         self.executed: list[tuple[str, tuple]] = []
+        self.fetched: list[tuple[str, tuple]] = []
         self.closed = False
 
     async def execute(self, query, *args):
@@ -29,6 +30,15 @@ class FakePool:
         # INSERT ... RETURNING id: telemetry ids count up from 1 like BIGSERIAL
         await self.execute(query, *args)
         return len(self.inserts)
+
+    async def fetch(self, query, *args):
+        # reads (e.g. routing's quality lookup) see an empty database
+        if self.delay:
+            await asyncio.sleep(self.delay)
+        if self.error is not None:
+            raise self.error
+        self.fetched.append((query, args))
+        return []
 
     async def close(self):
         self.closed = True

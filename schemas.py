@@ -8,7 +8,7 @@ class Message(BaseModel):
     content: str
 
 
-RoutingPolicy = Literal["cheap", "fast", "balanced"]
+RoutingPolicy = Literal["cheap", "fast", "balanced", "quality"]
 
 
 class ChatRequest(BaseModel):
@@ -25,7 +25,8 @@ class ChatRequest(BaseModel):
     # requested model is always honored regardless of this value.
     max_cost_usd: float | None = Field(default=None, ge=0)
     # How `azir-auto` ranks the eligible models: lowest estimated cost
-    # ("cheap"), lowest latency estimate ("fast"), or both ("balanced", the
+    # ("cheap"), lowest latency estimate ("fast"), highest historical
+    # LLM-judge quality ("quality"), or all three ("balanced", the
     # default). Ignored for explicitly requested models.
     routing_policy: RoutingPolicy | None = None
 

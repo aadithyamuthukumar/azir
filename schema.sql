@@ -32,12 +32,15 @@ CREATE INDEX IF NOT EXISTS request_telemetry_model_created_at_idx
 -- One row per LLM-judge verdict on a successful non-streaming response.
 -- telemetry_id is the evaluated attempt and judge_telemetry_id the judge
 -- call (its cost and latency); either is NULL if that telemetry write
--- failed, since telemetry persistence is best-effort.
+-- failed, since telemetry persistence is best-effort. task is the
+-- request's `task` (NULL if it had none); quality-aware routing averages
+-- scores per model and per model + task.
 CREATE TABLE IF NOT EXISTS response_evaluations (
     id                 BIGSERIAL PRIMARY KEY,
     telemetry_id       BIGINT REFERENCES request_telemetry (id) ON DELETE SET NULL,
     provider           TEXT NOT NULL,
     model              TEXT NOT NULL,
+    task               TEXT,
     judge_provider     TEXT NOT NULL,
     judge_model        TEXT NOT NULL,
     score              DOUBLE PRECISION NOT NULL CHECK (score >= 0 AND score <= 1),
@@ -45,6 +48,10 @@ CREATE TABLE IF NOT EXISTS response_evaluations (
     judge_telemetry_id BIGINT REFERENCES request_telemetry (id) ON DELETE SET NULL,
     created_at         TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+-- Tables created before `task` existed: existing rows keep task NULL and
+-- still count toward each model's overall quality.
+ALTER TABLE response_evaluations ADD COLUMN IF NOT EXISTS task TEXT;
 
 CREATE INDEX IF NOT EXISTS response_evaluations_model_created_at_idx
     ON response_evaluations (model, created_at);
