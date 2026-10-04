@@ -1,6 +1,6 @@
-from typing import Literal
+from typing import Annotated, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import AfterValidator, BaseModel, Field
 
 
 class Message(BaseModel):
@@ -42,4 +42,60 @@ class ChatResponse(BaseModel):
     model: str
     choices: list[Choice]
     usage: Usage
+
+
+# --- Telemetry analytics (GET /v1/analytics/*) ---
+#
+# Presentation rounding lives here, not in the SQL: latency in ms to 2
+# decimals, success rate and quality score as 0-1 fractions to 4 decimals.
+# Costs are left unrounded because per-request estimates can be fractions
+# of a cent.
+
+LatencyMs = Annotated[float, AfterValidator(lambda v: round(v, 2))]
+SuccessRate = Annotated[float, AfterValidator(lambda v: round(v, 4))]
+QualityScore = SuccessRate
+
+
+class AnalyticsSummary(BaseModel):
+    total_attempts: int
+    successful_attempts: int
+    failed_attempts: int
+    # null when there are no attempts
+    success_rate: SuccessRate | None
+    average_latency_ms: LatencyMs | None
+    total_prompt_tokens: int
+    total_completion_tokens: int
+    total_tokens: int
+    total_estimated_cost_usd: float
+
+
+class ModelAnalytics(BaseModel):
+    model: str
+    provider: str
+    attempt_count: int
+    success_count: int
+    failure_count: int
+    success_rate: SuccessRate
+    average_latency_ms: LatencyMs
+    total_tokens: int
+    total_estimated_cost_usd: float
+
+
+class ProviderAnalytics(BaseModel):
+    provider: str
+    attempt_count: int
+    success_count: int
+    failure_count: int
+    success_rate: SuccessRate
+    average_latency_ms: LatencyMs
+    total_tokens: int
+    total_estimated_cost_usd: float
+
+
+class QualityAnalytics(BaseModel):
+    # the evaluated model, not the judge
+    model: str
+    provider: str
+    evaluation_count: int
+    average_quality_score: QualityScore
 

@@ -1,14 +1,15 @@
 import time
 from typing import AsyncIterator
 
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
 
 from health import is_healthy, record_failure, record_success
+from judge import schedule_evaluation
 from latency import DEFAULT_LATENCY_ESTIMATE_MS, get_latency_estimate, record_latency
 from model_registry import ModelConfig, find_models, get_model
 from providers.errors import is_timeout_provider_error, is_transient_provider_error
 from schemas import ChatRequest, ChatResponse
-from telemetry import RequestTelemetry, estimate_cost_usd
+from telemetry import RequestTelemetry, estimate_cost_usd, publish
 
 # Virtual model name: Azir picks a capable model from the registry based on
 # the request's `task` and `routing_policy`.
@@ -214,25 +215,39 @@ def _get_provider(app: FastAPI, name: str):
     return getattr(app.state, f"{name}_provider")
 
 
+def _telemetry_sink(app: FastAPI):
+    # None when persistence isn't configured: telemetry is then only logged.
+    return getattr(app.state, "telemetry_store", None)
+
+
 def _with_model(request: ChatRequest, config: ModelConfig) -> ChatRequest:
     return request.model_copy(update={"model": config.name})
 
 
-async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
+async def route_request(
+    app: FastAPI,
+    request: ChatRequest,
+    background_tasks: BackgroundTasks | None = None,
+) -> ChatResponse:
     """Run a non-streaming request against the planned concrete models in
     order (see `plan_attempts`), moving to the next one only when a
     provider fails transiently (rate limit, 5xx, timeout, connection
     error). Any other provider error is raised immediately. If every
     attempt fails transiently, the last error is re-raised.
 
-    Each attempt (success or failure) emits a RequestTelemetry record for
-    the concrete provider/model that was actually attempted. Its latency
+    Each attempt (success or failure) publishes a RequestTelemetry record
+    for the concrete provider/model that was actually attempted -- logged,
+    and persisted if a telemetry store is configured. Its latency
     also feeds that model's routing estimate on success or timeout; fast
     error responses and connection failures don't, since their elapsed
     time says nothing about how fast the model answers. Each attempt also
     updates that model's health: a success, or a failure if it failed
     transiently. Non-transient errors (bad request, credentials, not
     found) aren't model-health signals and are not recorded.
+
+    If `background_tasks` is given and LLM judging is enabled, the
+    successful response is also queued for a quality evaluation that runs
+    after it is sent (see judge.py). It never changes the response.
     """
     last_error: HTTPException | None = None
 
@@ -244,13 +259,16 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
             response = await provider.complete(_with_model(request, config))
         except HTTPException as exc:
             latency_ms = (time.perf_counter() - started_at) * 1000
-            RequestTelemetry(
-                provider=config.provider,
-                model=config.name,
-                status="error",
-                status_code=exc.status_code,
-                latency_ms=latency_ms,
-            ).emit()
+            await publish(
+                RequestTelemetry(
+                    provider=config.provider,
+                    model=config.name,
+                    status="error",
+                    status_code=exc.status_code,
+                    latency_ms=latency_ms,
+                ),
+                _telemetry_sink(app),
+            )
 
             if is_timeout_provider_error(exc):
                 record_latency(config.name, latency_ms)
@@ -267,19 +285,23 @@ async def route_request(app: FastAPI, request: ChatRequest) -> ChatResponse:
         record_success(config.name)
 
         usage = response.usage
-        RequestTelemetry(
-            provider=config.provider,
-            model=config.name,
-            status="success",
-            status_code=200,
-            latency_ms=latency_ms,
-            prompt_tokens=usage.prompt_tokens,
-            completion_tokens=usage.completion_tokens,
-            total_tokens=usage.total_tokens,
-            estimated_cost_usd=estimate_cost_usd(
-                config.provider, config.name, usage.prompt_tokens, usage.completion_tokens
+        telemetry_id = await publish(
+            RequestTelemetry(
+                provider=config.provider,
+                model=config.name,
+                status="success",
+                status_code=200,
+                latency_ms=latency_ms,
+                prompt_tokens=usage.prompt_tokens,
+                completion_tokens=usage.completion_tokens,
+                total_tokens=usage.total_tokens,
+                estimated_cost_usd=estimate_cost_usd(
+                    config.provider, config.name, usage.prompt_tokens, usage.completion_tokens
+                ),
             ),
-        ).emit()
+            _telemetry_sink(app),
+        )
+        schedule_evaluation(background_tasks, app, request, config, response, telemetry_id)
 
         return response
 

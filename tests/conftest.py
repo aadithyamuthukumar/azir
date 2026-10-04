@@ -9,6 +9,12 @@ import pytest
 # a real provider call.
 os.environ["ANTHROPIC_API_KEY"] = "test-anthropic-key"
 os.environ["OPENAI_API_KEY"] = "test-openai-key"
+# Overrides any DATABASE_URL in a developer's .env: tests never touch a real
+# database (persistence is exercised with fakes).
+os.environ["DATABASE_URL"] = ""
+# LLM judging stays off unless a test enables it explicitly.
+os.environ["LLM_JUDGE_ENABLED"] = "false"
+os.environ["LLM_JUDGE_MODEL"] = "gpt-4o-mini"
 
 from health import reset_health  # noqa: E402
 from latency import reset_latency  # noqa: E402

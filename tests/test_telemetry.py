@@ -1,7 +1,9 @@
 import json
 import logging
 
-from telemetry import RequestTelemetry, estimate_cost_usd
+import pytest
+
+from telemetry import RequestTelemetry, estimate_cost_usd, publish
 
 
 def test_estimate_cost_usd_known_provider_and_model():
@@ -51,4 +53,52 @@ def test_emit_logs_one_json_line_with_expected_fields(caplog):
         "completion_tokens": 5,
         "total_tokens": 15,
         "estimated_cost_usd": 0.0001,
+        "traffic": "user",
     }
+
+
+class RecordingSink:
+    def __init__(self, error: Exception | None = None):
+        self.error = error
+        self.saved = []
+
+    async def save(self, record):
+        if self.error is not None:
+            raise self.error
+        self.saved.append(record)
+
+
+def make_record() -> RequestTelemetry:
+    return RequestTelemetry(provider="openai", model="gpt-4o-mini", status="success", status_code=200, latency_ms=1.0)
+
+
+@pytest.mark.anyio
+async def test_publish_logs_and_saves_to_sink(caplog):
+    sink = RecordingSink()
+    record = make_record()
+
+    with caplog.at_level(logging.INFO, logger="azir.telemetry"):
+        await publish(record, sink)
+
+    assert len(caplog.records) == 1
+    assert sink.saved == [record]
+
+
+@pytest.mark.anyio
+async def test_publish_without_sink_only_logs(caplog):
+    with caplog.at_level(logging.INFO, logger="azir.telemetry"):
+        await publish(make_record(), None)
+
+    assert len(caplog.records) == 1
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("error", [ConnectionRefusedError(), TimeoutError(), RuntimeError("boom")])
+async def test_publish_logs_and_swallows_sink_errors(caplog, error):
+    with caplog.at_level(logging.INFO, logger="azir.telemetry"):
+        await publish(make_record(), RecordingSink(error=error))
+
+    # the JSON record is still logged, followed by the persistence error
+    assert json.loads(caplog.records[0].message)["model"] == "gpt-4o-mini"
+    assert caplog.records[1].levelno == logging.ERROR
+    assert "Failed to persist telemetry" in caplog.records[1].message

@@ -54,11 +54,12 @@ class StubProvider:
         return self.stream_result
 
 
-def make_app(anthropic=None, openai=None):
+def make_app(anthropic=None, openai=None, telemetry_store=None):
     return SimpleNamespace(
         state=SimpleNamespace(
             anthropic_provider=anthropic or StubProvider(),
             openai_provider=openai or StubProvider(),
+            telemetry_store=telemetry_store,
         )
     )
 
@@ -810,6 +811,123 @@ async def test_route_request_emits_telemetry_for_each_attempt(caplog):
     assert records[1]["total_tokens"] == 2
     # cost comes from actual returned usage (1 + 1 tokens), not the routing estimate
     assert records[1]["estimated_cost_usd"] == pytest.approx(0.001 * 0.003 + 0.001 * 0.015)
+
+
+# --- Telemetry persistence ---
+
+
+def store_with_pool(**pool_kwargs):
+    from tests.test_telemetry_store import FakePool
+    from telemetry_store import TelemetryStore
+
+    pool = FakePool(**pool_kwargs)
+    return TelemetryStore(pool), pool
+
+
+@pytest.mark.anyio
+async def test_route_request_persists_success_row_for_concrete_model():
+    store, pool = store_with_pool()
+    app = make_app(openai=StubProvider(result=make_response(OPENAI_MODEL)), telemetry_store=store)
+
+    await route_request(app, make_request("azir-auto", "chat"))
+
+    [row] = pool.inserts
+    provider, model_name, status, status_code, latency_ms, *usage_and_cost = row
+    # concrete provider/model, never "azir-auto"
+    assert (provider, model_name, status, status_code) == ("openai", OPENAI_MODEL, "success", 200)
+    assert latency_ms >= 0
+    assert usage_and_cost == [1, 1, 2, pytest.approx(0.001 * 0.00015 + 0.001 * 0.0006), "user"]
+
+
+@pytest.mark.anyio
+async def test_route_request_fallback_persists_one_row_per_attempt():
+    store, pool = store_with_pool()
+    anthropic = StubProvider(error=upstream_error(503, 502))
+    openai = StubProvider(result=make_response(OPENAI_MODEL))
+
+    await route_request(make_app(anthropic, openai, store), make_request(ANTHROPIC_MODEL))
+
+    assert [row[:4] for row in pool.inserts] == [
+        ("anthropic", ANTHROPIC_MODEL, "error", 502),
+        ("openai", OPENAI_MODEL, "success", 200),
+    ]
+    # failed attempt: no usage, no cost
+    assert pool.inserts[0][5:9] == (None, None, None, None)
+
+
+@pytest.mark.anyio
+async def test_route_request_persists_non_transient_failure_before_raising():
+    store, pool = store_with_pool()
+    error = upstream_error(401, 401)
+
+    with pytest.raises(HTTPException) as exc_info:
+        await route_request(make_app(StubProvider(error=error), telemetry_store=store), make_request(ANTHROPIC_MODEL))
+
+    assert exc_info.value is error
+    assert [row[:4] for row in pool.inserts] == [("anthropic", ANTHROPIC_MODEL, "error", 401)]
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("db_error", [ConnectionRefusedError(), OSError("db down"), RuntimeError("boom")])
+async def test_database_failure_does_not_break_successful_response(caplog, db_error):
+    store, pool = store_with_pool(error=db_error)
+    app = make_app(openai=StubProvider(result=make_response(OPENAI_MODEL)), telemetry_store=store)
+
+    with caplog.at_level(logging.INFO, logger="azir.telemetry"):
+        response = await route_request(app, make_request(OPENAI_MODEL))
+
+    assert response.model == OPENAI_MODEL
+    assert pool.inserts == []
+    assert any("Failed to persist telemetry" in r.message for r in caplog.records)
+    # routing state is still updated
+    assert get_sample_count(OPENAI_MODEL) == 1
+    assert get_latency_stats(OPENAI_MODEL).samples == 1
+
+
+@pytest.mark.anyio
+async def test_database_failure_does_not_mask_provider_error_or_stop_fallback():
+    store, _pool = store_with_pool(error=ConnectionRefusedError())
+    anthropic = StubProvider(error=upstream_error(503, 502))
+    openai = StubProvider(result=make_response(OPENAI_MODEL))
+
+    response = await route_request(make_app(anthropic, openai, store), make_request(ANTHROPIC_MODEL))
+
+    assert response.model == OPENAI_MODEL
+
+
+@pytest.mark.anyio
+async def test_slow_database_is_bounded_and_does_not_break_response(monkeypatch):
+    import telemetry_store
+
+    monkeypatch.setattr(telemetry_store, "WRITE_TIMEOUT_SECONDS", 0.01)
+    store, pool = store_with_pool(delay=1.0)
+    app = make_app(openai=StubProvider(result=make_response(OPENAI_MODEL)), telemetry_store=store)
+
+    response = await route_request(app, make_request(OPENAI_MODEL))
+
+    assert response.model == OPENAI_MODEL
+    assert pool.inserts == []
+
+
+@pytest.mark.anyio
+@pytest.mark.parametrize("request_", [make_request("mystery-model"), make_request("azir-auto")])
+async def test_pre_provider_errors_persist_nothing(request_):
+    store, pool = store_with_pool()
+
+    with pytest.raises(HTTPException):
+        await route_request(make_app(telemetry_store=store), request_)
+
+    assert pool.executed == []
+
+
+@pytest.mark.anyio
+async def test_streaming_persists_nothing():
+    store, pool = store_with_pool()
+    openai = StubProvider(stream_result=object())
+
+    await stream_chat_completion(make_app(openai=openai, telemetry_store=store), make_request(OPENAI_MODEL))
+
+    assert pool.executed == []
 
 
 # --- Latency recording ---

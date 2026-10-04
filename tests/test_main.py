@@ -1,8 +1,12 @@
 import pytest
 from fastapi.testclient import TestClient
 
+import main
+import telemetry_store
 from main import app
+from telemetry_store import INSERT_SQL, SCHEMA_PATH
 from tests.test_router import StubProvider, make_response
+from tests.test_telemetry_store import FakePool
 
 
 async def fake_stream():
@@ -100,6 +104,63 @@ def test_streaming_azir_auto_returns_event_stream(client):
     assert response.headers["content-type"].startswith("text/event-stream")
     assert response.text.endswith("data: [DONE]\n\n")
     assert app.state.openai_provider.stream_requests[0].model == "gpt-4o-mini"
+
+
+def test_lifespan_without_database_url_only_logs_telemetry(client):
+    assert app.state.telemetry_store is None
+    assert client.post("/v1/chat/completions", json=body("gpt-4o-mini")).status_code == 200
+
+
+def test_lifespan_creates_one_pool_reuses_it_and_closes_it(monkeypatch):
+    pool = FakePool()
+    create_pool_calls = []
+
+    async def fake_create_pool(dsn, **kwargs):
+        create_pool_calls.append(dsn)
+        return pool
+
+    monkeypatch.setattr(main.settings, "database_url", "postgresql://user:pw@db:5432/azir")
+    monkeypatch.setattr(telemetry_store.asyncpg, "create_pool", fake_create_pool)
+
+    with TestClient(app) as test_client:
+        app.state.anthropic_provider = StubProvider(error=_upstream_503())
+        app.state.openai_provider = StubProvider(result=make_response("gpt-4o-mini"))
+
+        assert test_client.post("/v1/chat/completions", json=body("gpt-4o-mini")).status_code == 200
+        # explicit claude fails transiently, falls back to gpt-4o-mini: two rows
+        assert test_client.post("/v1/chat/completions", json=body("claude-sonnet-4-6")).status_code == 200
+        assert not pool.closed
+
+    assert create_pool_calls == ["postgresql://user:pw@db:5432/azir"]
+    assert pool.executed[0] == (SCHEMA_PATH.read_text(), ())
+    assert [query for query, _ in pool.executed[1:]] == [INSERT_SQL] * 3
+    assert [args[:4] for args in pool.inserts] == [
+        ("openai", "gpt-4o-mini", "success", 200),
+        ("anthropic", "claude-sonnet-4-6", "error", 502),
+        ("openai", "gpt-4o-mini", "success", 200),
+    ]
+    assert pool.closed
+
+
+def test_database_down_still_returns_successful_response(monkeypatch):
+    async def fake_create_pool(dsn, **kwargs):
+        return FakePool(error=ConnectionRefusedError())
+
+    monkeypatch.setattr(main.settings, "database_url", "postgresql://user:pw@db:5432/azir")
+    monkeypatch.setattr(telemetry_store.asyncpg, "create_pool", fake_create_pool)
+
+    with TestClient(app) as test_client:
+        app.state.openai_provider = StubProvider(result=make_response("gpt-4o-mini"))
+        response = test_client.post("/v1/chat/completions", json=body("gpt-4o-mini"))
+
+    assert response.status_code == 200
+    assert response.json()["model"] == "gpt-4o-mini"
+
+
+def _upstream_503():
+    from tests.test_router import upstream_error
+
+    return upstream_error(503, 502)
 
 
 def test_streaming_routing_error_is_400_before_stream_starts(client):
